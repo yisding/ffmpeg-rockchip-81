@@ -80,6 +80,11 @@ static const int desired_video_buffers = 256;
  */
 #define V4L_TS_CONVERT_READY V4L_TS_DEFAULT
 
+struct buf_data {
+    void **start;
+    unsigned int *len;
+};
+
 struct video_data {
     AVClass *class;
     int fd;
@@ -96,9 +101,9 @@ struct video_data {
     enum v4l2_buf_type buf_type;
 
     int buffers;
+    int plane_count;
     atomic_int buffers_queued;
-    void **buf_start;
-    unsigned int *buf_len;
+    struct buf_data *buf_data;
     char *standard;
     v4l2_std_id std_id;
     int channel;
@@ -356,6 +361,26 @@ static void list_standards(AVFormatContext *ctx)
     }
 }
 
+static void mmap_free(struct video_data *s, int n)
+{
+    if (!s->buf_data)
+        return;
+
+    for (int i = 0; i < n; i++) {
+        if (!s->buf_data[i].start || !s->buf_data[i].len)
+            continue;
+
+        for (int plane = 0; plane < s->plane_count; plane++) {
+            if (s->buf_data[i].start[plane])
+                v4l2_munmap(s->buf_data[i].start[plane], s->buf_data[i].len[plane]);
+        }
+        av_freep(&s->buf_data[i].start);
+        av_freep(&s->buf_data[i].len);
+    }
+    av_freep(&s->buf_data);
+    s->plane_count = 0;
+}
+
 static int mmap_init(AVFormatContext *ctx)
 {
     int i, res;
@@ -377,20 +402,16 @@ static int mmap_init(AVFormatContext *ctx)
         return AVERROR(ENOMEM);
     }
     s->buffers = req.count;
-    s->buf_start = av_malloc_array(s->buffers, sizeof(void *));
-    if (!s->buf_start) {
-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer pointers\n");
-        return AVERROR(ENOMEM);
-    }
-    s->buf_len = av_malloc_array(s->buffers, sizeof(unsigned int));
-    if (!s->buf_len) {
-        av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer sizes\n");
-        av_freep(&s->buf_start);
+    s->buf_data = av_calloc(s->buffers, sizeof(*s->buf_data));
+    if (!s->buf_data) {
+        av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer data\n");
         return AVERROR(ENOMEM);
     }
 
+    s->plane_count = 0;
     for (i = 0; i < req.count; i++) {
-        unsigned int buf_length, buf_offset;
+        int plane_count;
+        int total_frame_size = 0;
         struct v4l2_plane planes[VIDEO_MAX_PLANES];
         struct v4l2_buffer buf = {
             .type   = s->buf_type,
@@ -402,40 +423,57 @@ static int mmap_init(AVFormatContext *ctx)
         if (v4l2_ioctl(s->fd, VIDIOC_QUERYBUF, &buf) < 0) {
             res = AVERROR(errno);
             av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_QUERYBUF): %s\n", av_err2str(res));
-            return res;
+            goto fail;
         }
 
-        if (s->multiplanar) {
-            if (buf.length != 1) {
-                av_log(ctx, AV_LOG_ERROR, "multiplanar only supported when buf.length == 1\n");
-                return AVERROR_PATCHWELCOME;
+        plane_count = s->multiplanar ? buf.length : 1;
+        if (s->plane_count && s->plane_count != plane_count) {
+            av_log(ctx, AV_LOG_ERROR, "Plane count differed between buffers\n");
+            res = AVERROR(EINVAL);
+            goto fail;
+        }
+        s->plane_count = plane_count;
+
+        s->buf_data[i].start = av_calloc(s->plane_count, sizeof(*s->buf_data[i].start));
+        s->buf_data[i].len = av_calloc(s->plane_count, sizeof(*s->buf_data[i].len));
+        if (!s->buf_data[i].start || !s->buf_data[i].len) {
+            av_log(ctx, AV_LOG_ERROR, "Cannot allocate plane data\n");
+            res = AVERROR(ENOMEM);
+            goto fail;
+        }
+
+        for (int plane = 0; plane < s->plane_count; plane++) {
+            unsigned int buf_length = s->multiplanar ? buf.m.planes[plane].length : buf.length;
+            unsigned int buf_offset = s->multiplanar ? buf.m.planes[plane].m.mem_offset : buf.m.offset;
+
+            s->buf_data[i].len[plane] = buf_length;
+            total_frame_size += buf_length;
+            s->buf_data[i].start[plane] = v4l2_mmap(NULL, buf_length,
+                                                    PROT_READ | PROT_WRITE, MAP_SHARED,
+                                                    s->fd, buf_offset);
+
+            if (s->buf_data[i].start[plane] == MAP_FAILED) {
+                s->buf_data[i].start[plane] = NULL;
+                res = AVERROR(errno);
+                av_log(ctx, AV_LOG_ERROR, "mmap: %s\n", av_err2str(res));
+                goto fail;
             }
-            buf_length = buf.m.planes[0].length;
-            buf_offset = buf.m.planes[0].m.mem_offset;
-        } else {
-            buf_length = buf.length;
-            buf_offset = buf.m.offset;
         }
 
-        s->buf_len[i] = buf_length;
-        if (s->frame_size > 0 && s->buf_len[i] < s->frame_size) {
+        if (s->frame_size > 0 && total_frame_size < s->frame_size) {
             av_log(ctx, AV_LOG_ERROR,
-                   "buf_len[%d] = %d < expected frame size %d\n",
-                   i, s->buf_len[i], s->frame_size);
-            return AVERROR(ENOMEM);
-        }
-        s->buf_start[i] = v4l2_mmap(NULL, buf_length,
-                               PROT_READ | PROT_WRITE, MAP_SHARED,
-                               s->fd, buf_offset);
-
-        if (s->buf_start[i] == MAP_FAILED) {
-            res = AVERROR(errno);
-            av_log(ctx, AV_LOG_ERROR, "mmap: %s\n", av_err2str(res));
-            return res;
+                   "buf_data[%d].len = %d < expected frame size %d\n",
+                   i, total_frame_size, s->frame_size);
+            res = AVERROR(ENOMEM);
+            goto fail;
         }
     }
 
     return 0;
+
+fail:
+    mmap_free(s, i + 1);
+    return res;
 }
 
 static int enqueue_buffer(struct video_data *s, struct v4l2_buffer *buf)
@@ -541,7 +579,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         .length   = s->multiplanar ? VIDEO_MAX_PLANES : 0,
     };
     struct timeval buf_ts;
-    unsigned int bytesused;
+    unsigned int bytesused = 0;
     int res;
 
     pkt->size = 0;
@@ -568,7 +606,12 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     // always keep at least one buffer queued
     av_assert0(atomic_load(&s->buffers_queued) >= 1);
 
-    bytesused = s->multiplanar ? buf.m.planes[0].bytesused : buf.bytesused;
+    if (s->multiplanar) {
+        for (int plane = 0; plane < buf.length; plane++)
+            bytesused += buf.m.planes[plane].bytesused;
+    } else {
+        bytesused = buf.bytesused;
+    }
 
 #ifdef V4L2_BUF_FLAG_ERROR
     if (buf.flags & V4L2_BUF_FLAG_ERROR) {
@@ -576,6 +619,12 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
                "Dequeued v4l2 buffer contains corrupted data (%d bytes).\n",
                bytesused);
         bytesused = 0;
+        if (s->multiplanar) {
+            for (int plane = 0; plane < buf.length; plane++)
+                buf.m.planes[plane].bytesused = 0;
+        } else {
+            buf.bytesused = 0;
+        }
     } else
 #endif
     {
@@ -589,11 +638,18 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
                    "Dequeued v4l2 buffer contains %d bytes, but %d were expected. Flags: 0x%08X.\n",
                    bytesused, s->frame_size, buf.flags);
             bytesused = 0;
+            if (s->multiplanar) {
+                for (int plane = 0; plane < buf.length; plane++)
+                    buf.m.planes[plane].bytesused = 0;
+            } else {
+                buf.bytesused = 0;
+            }
         }
     }
 
-    /* Image is at s->buff_start[buf.index] */
-    if (atomic_load(&s->buffers_queued) == FFMAX(s->buffers / 8, 1)) {
+    /* Image is at s->buf_data[buf.index].start */
+    if (s->multiplanar ||
+        atomic_load(&s->buffers_queued) == FFMAX(s->buffers / 8, 1)) {
         /* when we start getting low on queued buffers, fall back on copying data */
         res = av_new_packet(pkt, bytesused);
         if (res < 0) {
@@ -601,7 +657,18 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
             enqueue_buffer(s, &buf);
             return res;
         }
-        memcpy(pkt->data, s->buf_start[buf.index], bytesused);
+        if (s->multiplanar) {
+            unsigned int offset = 0;
+
+            for (int plane = 0; plane < buf.length; plane++) {
+                memcpy(pkt->data + offset,
+                       (uint8_t *)s->buf_data[buf.index].start[plane] + buf.m.planes[plane].data_offset,
+                       buf.m.planes[plane].bytesused);
+                offset += buf.m.planes[plane].bytesused;
+            }
+        } else {
+            memcpy(pkt->data, s->buf_data[buf.index].start[0], bytesused);
+        }
 
         res = enqueue_buffer(s, &buf);
         if (res) {
@@ -611,7 +678,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     } else {
         struct buff_data *buf_descriptor;
 
-        pkt->data     = s->buf_start[buf.index];
+        pkt->data     = s->buf_data[buf.index].start[0];
         pkt->size     = bytesused;
 
         buf_descriptor = av_malloc(sizeof(struct buff_data));
@@ -681,18 +748,12 @@ static int mmap_start(AVFormatContext *ctx)
 static void mmap_close(struct video_data *s)
 {
     enum v4l2_buf_type type;
-    int i;
-
     type = s->buf_type;
     /* We do not check for the result, because we could
      * not do anything about it anyway...
      */
     v4l2_ioctl(s->fd, VIDIOC_STREAMOFF, &type);
-    for (i = 0; i < s->buffers; i++) {
-        v4l2_munmap(s->buf_start[i], s->buf_len[i]);
-    }
-    av_freep(&s->buf_start);
-    av_freep(&s->buf_len);
+    mmap_free(s, s->buffers);
 }
 
 static int v4l2_set_parameters(AVFormatContext *ctx)
