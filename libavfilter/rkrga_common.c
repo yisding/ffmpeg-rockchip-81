@@ -57,8 +57,9 @@ typedef struct RGAFormatMap {
     { AV_PIX_FMT_NV24,     RK_FORMAT_YCbCr_444_SP },     /* RGA2-Pro only */ \
     { AV_PIX_FMT_NV42,     RK_FORMAT_YCrCb_444_SP },     /* RGA2-Pro only */ \
     { AV_PIX_FMT_P010,     RK_FORMAT_YCbCr_420_SP_10B }, /* RGA3 only */ \
+    { AV_PIX_FMT_P210,     RK_FORMAT_YCbCr_422_SP_10B }, /* RGA3 only */ \
     { AV_PIX_FMT_NV15,     RK_FORMAT_YCbCr_420_SP_10B }, /* RGA2 only input, aka P010 compact */ \
-    { AV_PIX_FMT_NV20,     RK_FORMAT_YCbCr_422_SP_10B }, \
+    { AV_PIX_FMT_NV20,     RK_FORMAT_YCbCr_422_SP_10B }, /* RGA2 only input, aka P210 compact */ \
     { AV_PIX_FMT_YUYV422,  RK_FORMAT_YUYV_422 }, \
     { AV_PIX_FMT_YVYU422,  RK_FORMAT_YVYU_422 }, \
     { AV_PIX_FMT_UYVY422,  RK_FORMAT_UYVY_422 },
@@ -361,6 +362,13 @@ static int verify_rga_frame_info_io_dynamic(AVFilterContext *avctx,
          out->pix_fmt == AV_PIX_FMT_P010)) {
         av_log(avctx, AV_LOG_ERROR, "'%s' is not supported if RGA2 is requested\n",
                av_get_pix_fmt_name(AV_PIX_FMT_P010));
+        return AVERROR(ENOSYS);
+    }
+    if (r->is_rga2_used &&
+        (in->pix_fmt == AV_PIX_FMT_P210 ||
+         out->pix_fmt == AV_PIX_FMT_P210)) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' is not supported if RGA2 is requested\n",
+               av_get_pix_fmt_name(AV_PIX_FMT_P210));
         return AVERROR(ENOSYS);
     }
     if (r->is_rga2_used &&
@@ -1069,7 +1077,8 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
         info->act_h = ALIGN_DOWN(info->act_h, RK_RGA_YUV_ALIGN);
     }
 
-    info->uncompact_10b_msb = info->pix_fmt == AV_PIX_FMT_P010;
+    info->uncompact_10b_msb = info->pix_fmt == AV_PIX_FMT_P010 ||
+                              info->pix_fmt == AV_PIX_FMT_P210;
 
     if (link->w * link->h > (3840 * 2160 * 3))
         r->async_depth = FFMIN(r->async_depth, 1);
