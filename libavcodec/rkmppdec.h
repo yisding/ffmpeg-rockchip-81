@@ -106,7 +106,7 @@ static const enum AVPixelFormat rkmpp_dec_pix_fmts[] = {
     AV_PIX_FMT_NV12,
     AV_PIX_FMT_NV16,
     AV_PIX_FMT_NV15,
-    AV_PIX_FMT_NV20,
+    AV_PIX_FMT_NV20_PACKED,
     AV_PIX_FMT_DRM_PRIME,
     AV_PIX_FMT_NONE,
 };
