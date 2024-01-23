@@ -560,3 +560,4 @@ gbrp10msble     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_cr
 gbrp12msbbe     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_crc: 0x00000000,  black_pc_crc: 0x00000000
 gbrp12msble     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_crc: 0x00000000,  black_pc_crc: 0x00000000
 nv15            planes: 2, linesizes:  80  80   0   0, plane_sizes:  3840  1920     0     0, plane_offsets:  3840     0     0, total_size: 5760
+nv20            planes: 2, linesizes:  80  80   0   0, plane_sizes:  3840  3840     0     0, plane_offsets:  3840     0     0, total_size: 7680
