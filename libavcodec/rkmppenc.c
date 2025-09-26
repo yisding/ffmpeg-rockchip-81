@@ -541,6 +541,15 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
             mpp_enc_cfg_set_s32(cfg, "rc:qp_min", qp_min);
             mpp_enc_cfg_set_s32(cfg, "rc:qp_max_i",qp_max_i);
             mpp_enc_cfg_set_s32(cfg, "rc:qp_min_i", qp_min_i);
+
+            /* Intra Refresh / GDR */
+            if (r->intra_refresh && r->refresh_num) {
+                mpp_enc_cfg_set_u32(cfg, "rc:refresh_en", 1);
+                mpp_enc_cfg_set_u32(cfg, "rc:refresh_mode", r->refresh_mode);
+                mpp_enc_cfg_set_u32(cfg, "rc:refresh_num", r->refresh_num);
+                av_log(avctx, AV_LOG_VERBOSE, "Requested to use Intra Refresh, "
+                       "Mode/Num is set to %d/%d\n", r->refresh_mode, r->refresh_num);
+            }
         }
         break;
     case AV_CODEC_ID_MJPEG:
@@ -624,7 +633,8 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
 
     if (avctx->codec_id == AV_CODEC_ID_H264 ||
         avctx->codec_id == AV_CODEC_ID_HEVC) {
-        sei_mode = r->udu_sei ? MPP_ENC_SEI_MODE_ONE_FRAME : MPP_ENC_SEI_MODE_DISABLE;
+        sei_mode = (r->udu_sei || (r->intra_refresh && r->refresh_num))
+                   ? MPP_ENC_SEI_MODE_ONE_FRAME : MPP_ENC_SEI_MODE_DISABLE;
         if ((ret = r->mapi->control(r->mctx, MPP_ENC_SET_SEI_CFG, &sei_mode)) != MPP_OK) {
             av_log(avctx, AV_LOG_ERROR, "Failed to set SEI config: %d\n", ret);
             return AVERROR_EXTERNAL;
