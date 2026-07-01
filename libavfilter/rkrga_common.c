@@ -557,6 +557,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     AVBufferRef *hw_frame_ctx = pat_preproc ? r->pat_preproc_hwframes_ctx :
                                               ff_filter_link(outlink)->hw_frames_ctx;
     int w_stride = 0, h_stride = 0;
+    int act_w, act_h;
     AVDRMFrameDescriptor *desc;
     AVDRMLayerDescriptor *layer;
     RGAFrame **frame_list = NULL;
@@ -564,6 +565,14 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
 
     if (!out_info || !hw_frame_ctx)
         return NULL;
+
+    if (pat_preproc) {
+        act_w = FFMIN(in0_info->act_w - in1_info->overlay_x, in1_info->act_w);
+        act_h = FFMIN(in0_info->act_h - in1_info->overlay_y, in1_info->act_h);
+    } else {
+        act_w = out_info->act_w;
+        act_h = out_info->act_h;
+    }
 
     frame_list = pat_preproc ? &r->pat_frame_list : &r->dst_frame_list;
 
@@ -607,7 +616,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         goto fail;
 
     if (r->is_rga2_used || out_info->scheduler_core == 0x4) {
-        if (!r->has_rga2p && pat_preproc && (info.rect.width > 4096 || info.rect.height > 4096)) {
+        if (!r->has_rga2p && pat_preproc && (act_w > 4096 || act_h > 4096)) {
             av_log(ctx, AV_LOG_ERROR, "Max supported output size of RGA2 (non-Pro) is 4096x4096\n");
             goto fail;
         }
@@ -665,12 +674,11 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
 
     if (pat_preproc)
         rga_set_rect(&info.rect, in1_info->overlay_x, in1_info->overlay_y,
-                     FFMIN((in0_info->act_w - in1_info->overlay_x), in1_info->act_w),
-                     FFMIN((in0_info->act_h - in1_info->overlay_y), in1_info->act_h),
+                     act_w, act_h,
                      w_stride, h_stride, in1_info->rga_fmt);
     else
         rga_set_rect(&info.rect, out_info->act_x, out_info->act_y,
-                     out_info->act_w, out_info->act_h,
+                     act_w, act_h,
                      w_stride, h_stride, out_info->rga_fmt);
 
     if (is_afbc) {
