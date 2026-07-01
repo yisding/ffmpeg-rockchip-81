@@ -151,7 +151,7 @@ const FFCodec ff_##x##_rkmpp_decoder = { \
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
                       FF_CODEC_CAP_INIT_CLEANUP | \
                       FF_CODEC_CAP_SETS_FRAME_PROPS, \
-    .p.pix_fmts     = rkmpp_dec_pix_fmts, \
+    CODEC_PIXFMTS_ARRAY(rkmpp_dec_pix_fmts), \
     .hw_configs     = rkmpp_dec_hw_configs, \
     .p.wrapper_name = "rkmpp", \
 };

@@ -134,7 +134,7 @@ static const AVOption h264_options[] = {
         { "main",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_PROFILE_H264_MAIN },     INT_MIN, INT_MAX, VE, "profile" },
         { "high",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_PROFILE_H264_HIGH },     INT_MIN, INT_MAX, VE, "profile" },
     { "level", "Set the encoding level restriction", OFFSET(level), AV_OPT_TYPE_INT,
-            { .i64 = 0 }, FF_LEVEL_UNKNOWN, 62, VE, "level" },
+            { .i64 = 0 }, AV_LEVEL_UNKNOWN, 62, VE, "level" },
         { "1",          NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 10 }, 0, 0, VE, "level" },
         { "1.1",        NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 11 }, 0, 0, VE, "level" },
         { "1.2",        NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 12 }, 0, 0, VE, "level" },
@@ -177,7 +177,7 @@ static const AVOption hevc_options[] = {
         { "main",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, INT_MIN, INT_MAX, VE, "tier" },
         { "high",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, INT_MIN, INT_MAX, VE, "tier" },
     { "level", "Set the encoding level restriction", OFFSET(level), AV_OPT_TYPE_INT,
-            { .i64 = 0 }, FF_LEVEL_UNKNOWN, 186, VE, "level" },
+            { .i64 = 0 }, AV_LEVEL_UNKNOWN, 186, VE, "level" },
         { "1",          NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 30 }, 0, 0, VE, "level" },
         { "2",          NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 60 }, 0, 0, VE, "level" },
         { "2.1",        NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 63 }, 0, 0, VE, "level" },
@@ -311,7 +311,7 @@ const FFCodec ff_##x##_rkmpp_encoder = { \
     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE, \
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
                       FF_CODEC_CAP_INIT_CLEANUP, \
-    .p.pix_fmts     = rkmpp_enc_pix_fmts_##xx, \
+    CODEC_PIXFMTS_ARRAY(rkmpp_enc_pix_fmts_##xx), \
     .hw_configs     = rkmpp_enc_hw_configs, \
     .defaults       = rkmpp_enc_defaults, \
     .p.wrapper_name = "rkmpp", \
