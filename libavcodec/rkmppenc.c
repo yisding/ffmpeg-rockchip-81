@@ -163,6 +163,9 @@ static int get_byte_stride(const AVDRMObjectDescriptor *object,
     plane0 = &layer->planes[0];
     plane1 = &layer->planes[1];
 
+    if (plane0->pitch <= 0)
+        return AVERROR(EINVAL);
+
     *hs = plane0->pitch;
     *vs = is_packed_fmt ?
         ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2) :

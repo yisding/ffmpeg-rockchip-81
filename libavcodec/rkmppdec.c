@@ -888,8 +888,12 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
     if (r->eof)
         return AVERROR_EOF;
 
-    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
-        timeout = FFMAX(timeout, MPP_TIMEOUT_NON_BLOCK);
+    /* the MJPEG decoder is 1-in-1-out and never signals an EOS frame:
+     * a blocking drain poll would wait forever once the queue is empty,
+     * but a non-blocking one would drop frames still being decoded */
+    if (avctx->codec_id == AV_CODEC_ID_MJPEG && timeout == MPP_TIMEOUT_BLOCK)
+        timeout = r->frames_pending > 0 ? MPP_TIMEOUT_MAX
+                                        : MPP_TIMEOUT_NON_BLOCK;
 
     if ((ret = r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to set output timeout: %d\n", ret);
@@ -911,6 +915,8 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             av_log(avctx, AV_LOG_DEBUG, "Timeout getting decoded frame\n");
         return AVERROR(EAGAIN);
     }
+    if (avctx->codec_id == AV_CODEC_ID_MJPEG && r->frames_pending > 0)
+        r->frames_pending--;
     if (mpp_frame_get_eos(mpp_frame)) {
         av_log(avctx, AV_LOG_DEBUG, "Received a 'EOS' frame\n");
         /* EOS frame may contain valid data */
@@ -930,7 +936,7 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         int ignore_err = !explode &&
                          ((avctx->codec_id != AV_CODEC_ID_MJPEG) ||
                           (avctx->err_recognition & AV_EF_IGNORE_ERR));
-        int log_level = ignore_err ? AV_LOG_DEBUG : AV_LOG_ERROR;
+        int log_level = ignore_err ? AV_LOG_WARNING : AV_LOG_ERROR;
 
         av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
         if (avctx->codec_id == AV_CODEC_ID_MJPEG)
@@ -940,8 +946,12 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             ret = AVERROR_INVALIDDATA;
             goto exit;
         }
-        if (!ignore_err)
-            r->eof = 1; /* bail out from the loop */
+        if (!ignore_err) {
+            /* bail out from the loop, surfacing the error instead of a clean EOF */
+            r->eof = 1;
+            ret = AVERROR_INVALIDDATA;
+            goto exit;
+        }
         ret = AVERROR(EAGAIN);
         goto exit;
     }
@@ -1188,7 +1198,33 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
 
     /* avoid sending new data after EOS */
     if (r->draining)
-        return AVERROR(EOF);
+        return AVERROR_EOF;
+
+    /* parameter sets may exist only out-of-band, e.g. Annex B SPS/PPS from
+     * RTSP sprop-parameter-sets, which the mp4toannexb BSF passes through
+     * without injecting: send the extradata before the first packet */
+    if (!r->extradata_sent && avctx->codec_id != AV_CODEC_ID_MJPEG) {
+        const uint8_t *extradata;
+        int extradata_size;
+
+        ff_decode_get_extradata(avctx, &extradata, &extradata_size);
+        if (extradata && extradata_size > 0) {
+            if ((ret = mpp_packet_init(&mpp_pkt, (void *)extradata,
+                                       extradata_size)) != MPP_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to init extradata packet: %d\n", ret);
+                return AVERROR_EXTERNAL;
+            }
+            ret = r->mapi->decode_put_packet(r->mctx, mpp_pkt);
+            mpp_packet_deinit(&mpp_pkt);
+            if (ret != MPP_OK) {
+                av_log(avctx, AV_LOG_TRACE, "Decoder buffer is full\n");
+                return AVERROR(EAGAIN);
+            }
+            av_log(avctx, AV_LOG_DEBUG, "Wrote %d bytes of extradata to decoder\n",
+                   extradata_size);
+        }
+        r->extradata_sent = 1;
+    }
 
     /* do not skip non-key pkt until got any frame */
     if (r->got_frame &&
@@ -1274,6 +1310,9 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
             mpp_packet_deinit(&mpp_pkt);
         return AVERROR(EAGAIN);
     }
+    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
+        r->frames_pending++;
+
     /* update the last pts */
     r->last_pts = pkt->pts == AV_NOPTS_VALUE ? last_pts : pkt->pts;
 
@@ -1326,10 +1365,13 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             /* send pending data to decoder */
             ret = rkmpp_send_packet(avctx, pkt);
             if (ret == AVERROR(EAGAIN)) {
-                /* some streams might need more packets to start returning frames */
+                /* some streams might need more packets to start returning frames,
+                 * but always hand control back to the caller afterwards: looping
+                 * here would deadlock if the caller still holds references to
+                 * all decoded frames (the buffer group is exhausted and the
+                 * caller can only release frames once we return) */
                 ret = rkmpp_get_frame(avctx, frame, 100);
-                if (ret != AVERROR(EAGAIN))
-                    goto exit;
+                goto exit;
             } else if (ret < 0) {
                 av_log(avctx, AV_LOG_ERROR, "Decoder failed to send packet: %d\n", ret);
                 goto exit;
@@ -1359,6 +1401,9 @@ static av_cold void rkmpp_decode_flush(AVCodecContext *avctx)
         r->draining = 0;
         r->info_change = 0;
         r->got_frame = 0;
+        r->last_pts = AV_NOPTS_VALUE;
+        r->extradata_sent = 0;
+        r->frames_pending = 0;
 
         av_packet_unref(&r->last_pkt);
     } else
