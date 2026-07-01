@@ -241,6 +241,7 @@ static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
     r->info_change = 0;
     r->got_frame = 0;
     r->use_rfbc = 0;
+    av_packet_unref(&r->last_pkt);
 
     if (r->mapi) {
         r->mapi->reset(r->mctx);
@@ -257,8 +258,11 @@ static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
         r->buf_group_misc = NULL;
     }
 
-    if (r->hwframe)
+    if (r->hwframe) {
         av_buffer_unref(&r->hwframe);
+        if (r->buf_mode == RKMPP_DEC_HALF_INTERNAL)
+            r->buf_group = NULL;
+    }
     if (r->hwdevice)
         av_buffer_unref(&r->hwdevice);
 
@@ -470,6 +474,8 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
         return AVERROR(ENOMEM);
 
     av_buffer_unref(&r->hwframe);
+    if (r->buf_mode == RKMPP_DEC_HALF_INTERNAL)
+        r->buf_group = NULL;
 
     r->hwframe = av_hwframe_ctx_alloc(r->hwdevice);
     if (!r->hwframe)
@@ -567,7 +573,6 @@ attach:
 fail:
     if (r->buf_group &&
         r->buf_mode == RKMPP_DEC_HALF_INTERNAL) {
-        mpp_buffer_group_put(r->buf_group);
         r->buf_group = NULL;
     }
     av_buffer_unref(&r->hwframe);
