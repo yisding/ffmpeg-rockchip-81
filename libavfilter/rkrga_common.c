@@ -134,6 +134,9 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
     plane0 = &layer->planes[0];
     plane1 = &layer->planes[1];
 
+    if (plane0->pitch <= 0)
+        return AVERROR(EINVAL);
+
     *ws = is_packed_fmt ?
         (plane0->pitch / bytes_pp) :
         plane0->pitch;
