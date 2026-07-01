@@ -681,6 +681,9 @@ static int frame_create_buf(AVFrame *frame,
     return AVERROR(EINVAL);
 }
 
+/* Exports the given MppFrame into the AVFrame.
+ * Ownership of mpp_frame is always consumed, on success and on failure:
+ * the caller must not deinit it after this call. */
 static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mpp_frame)
 {
     RKMPPDecContext *r = avctx->priv_data;
@@ -692,16 +695,22 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     int mpp_frame_mode = 0;
     int ret, is_afbc = 0;
 
-    if (!frame || !mpp_frame)
-        return AVERROR(ENOMEM);
+    if (!frame || !mpp_frame) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
 
     mpp_buf = mpp_frame_get_buffer(mpp_frame);
-    if (!mpp_buf)
-        return AVERROR(EAGAIN);
+    if (!mpp_buf) {
+        ret = AVERROR(EAGAIN);
+        goto fail;
+    }
 
     desc = av_mallocz(sizeof(*desc));
-    if (!desc)
-        return AVERROR(ENOMEM);
+    if (!desc) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
 
     desc->drm_desc.nb_objects = 1;
     desc->buffers[0] = mpp_buf;
@@ -727,7 +736,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
 
         pix_desc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
         if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0)
-            return ret;
+            goto fail;
 
         /* MPP specific AFBC src_y offset, not memory address offset */
         frame->crop_top = r->use_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
@@ -747,20 +756,25 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
 
     if ((ret = frame_create_buf(frame, mpp_frame, mpp_frame_get_buf_size(mpp_frame),
                                 rkmpp_free_mpp_frame, mpp_frame, AV_BUFFER_FLAG_READONLY)) < 0)
-        return ret;
+        goto fail;
+    /* from here on, mpp_frame is owned by frame->buf[] */
 
     if ((ret = frame_create_buf(frame, (uint8_t *)desc, sizeof(*desc),
-                                rkmpp_free_drm_desc, desc, AV_BUFFER_FLAG_READONLY)) < 0)
-        return ret;
+                                rkmpp_free_drm_desc, desc, AV_BUFFER_FLAG_READONLY)) < 0) {
+        av_free(desc);
+        goto fail_unref;
+    }
 
     frame->data[0] = (uint8_t *)desc;
 
     frame->hw_frames_ctx = av_buffer_ref(r->hwframe);
-    if (!frame->hw_frames_ctx)
-        return AVERROR(ENOMEM);
+    if (!frame->hw_frames_ctx) {
+        ret = AVERROR(ENOMEM);
+        goto fail_unref;
+    }
 
     if ((ret = ff_decode_frame_props(avctx, frame)) < 0)
-        return ret;
+        goto fail_unref;
 
     frame->width  = avctx->width;
     frame->height = avctx->height;
@@ -785,13 +799,24 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
          frame->color_trc == AVCOL_TRC_ARIB_STD_B67)) {
         ret = rkmpp_export_mastering_display(avctx, frame, mpp_frame_get_mastering_display(mpp_frame));
         if (ret < 0)
-            return ret;
+            goto fail_unref;
         ret = rkmpp_export_content_light(frame, mpp_frame_get_content_light(mpp_frame));
         if (ret < 0)
-            return ret;
+            goto fail_unref;
     }
 
     return 0;
+
+fail:
+    av_free(desc);
+    if (mpp_frame)
+        mpp_frame_deinit(&mpp_frame);
+    return ret;
+
+fail_unref:
+    /* frees mpp_frame (and desc, if attached) via the buf[] callbacks */
+    av_frame_unref(frame);
+    return ret;
 }
 
 static void rkmpp_export_avctx_color_props(AVCodecContext *avctx, MppFrame mpp_frame)
@@ -901,21 +926,27 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         goto exit;
     }
     if (ret = mpp_frame_get_errinfo(mpp_frame)) {
-        int ignore_err = (avctx->codec_id != AV_CODEC_ID_MJPEG) ||
-                         (avctx->err_recognition & AV_EF_IGNORE_ERR);
+        int explode = avctx->err_recognition & AV_EF_EXPLODE;
+        int ignore_err = !explode &&
+                         ((avctx->codec_id != AV_CODEC_ID_MJPEG) ||
+                          (avctx->err_recognition & AV_EF_IGNORE_ERR));
         int log_level = ignore_err ? AV_LOG_DEBUG : AV_LOG_ERROR;
 
         av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
         if (avctx->codec_id == AV_CODEC_ID_MJPEG)
             av_log(avctx, log_level, "The YCbCr format may not be supported. Supported: "
                    "YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | YUV444(1*1:1*1:1*1)\n");
+        if (explode) {
+            ret = AVERROR_INVALIDDATA;
+            goto exit;
+        }
         if (!ignore_err)
             r->eof = 1; /* bail out from the loop */
         ret = AVERROR(EAGAIN);
         goto exit;
     }
 
-    if (r->info_change = mpp_frame_get_info_change(mpp_frame) ||
+    if ((r->info_change = mpp_frame_get_info_change(mpp_frame)) ||
         (avctx->codec_id == AV_CODEC_ID_MJPEG && !r->buf_group)) {
         char *opts = NULL;
         int fast_parse = r->fast_parse;
@@ -997,9 +1028,10 @@ export:
         switch (avctx->pix_fmt) {
         case AV_PIX_FMT_DRM_PRIME:
             {
-                if ((ret = rkmpp_export_frame(avctx, frame, mpp_frame)) < 0)
+                ret = rkmpp_export_frame(avctx, frame, mpp_frame);
+                mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
+                if (ret < 0)
                     goto exit;
-                mpp_frame = NULL;
                 return 0;
             }
             break;
@@ -1014,9 +1046,12 @@ export:
                     ret = AVERROR(ENOMEM);
                     goto exit;
                 }
-                if ((ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame)) < 0)
+                ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame);
+                mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
+                if (ret < 0) {
+                    av_frame_free(&tmp_frame);
                     goto exit;
-                mpp_frame = NULL;
+                }
 
                 if ((ret = ff_get_buffer(avctx, frame, 0)) < 0) {
                     av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed: %d\n", ret);
