@@ -194,18 +194,31 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
     return (*stride > 0) ? 0 : AVERROR(EINVAL);
 }
 
-static unsigned get_used_frame_count(MPPEncFrame *list)
+static unsigned get_sent_frame_count(MPPEncFrame *list)
 {
     unsigned count = 0;
 
     while (list) {
-        if (list->queued == 1 &&
-            (list->frame || list->mpp_frame))
+        if (list->queued && list->sent)
             ++count;
         list = list->next;
     }
 
     return count;
+}
+
+static MPPEncFrame *get_oldest_unsent_frame(MPPEncFrame *list)
+{
+    MPPEncFrame *out = NULL;
+
+    while (list) {
+        if (list->queued && !list->sent && list->mpp_frame &&
+            (!out || list->order < out->order))
+            out = list;
+        list = list->next;
+    }
+
+    return out;
 }
 
 static void clear_unused_frames(MPPEncFrame *list)
@@ -230,6 +243,7 @@ static void clear_unused_frames(MPPEncFrame *list)
 
                 av_frame_free(&list->frame);
                 list->queued = 0;
+                list->sent = 0;
             }
         }
         list = list->next;
@@ -737,6 +751,8 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
     mpp_enc_frame = get_free_frame(&r->frame_list);
     if (!mpp_enc_frame)
         return NULL;
+    mpp_enc_frame->sent = 0;
+    mpp_enc_frame->order = r->frame_order++;
 
     if ((ret = mpp_frame_init(&mpp_frame)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to init MPP frame: %d\n", ret);
@@ -1047,25 +1063,37 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
                    !(avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
                    ? MPP_TIMEOUT_NON_BLOCK : MPP_TIMEOUT_BLOCK;
 
-    if (get_used_frame_count(r->frame_list) > r->async_frames)
-        goto get;
+    if (!frame)
+        timeout = MPP_TIMEOUT_BLOCK;
 
-    mpp_enc_frame = rkmpp_submit_frame(avctx, (AVFrame *)frame);
-    if (!mpp_enc_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to submit frame on input\n");
-        return AVERROR(ENOMEM);
+    clear_unused_frames(r->frame_list);
+
+    if (frame || !r->eos_queued) {
+        mpp_enc_frame = rkmpp_submit_frame(avctx, (AVFrame *)frame);
+        if (!mpp_enc_frame) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to submit frame on input\n");
+            return AVERROR(ENOMEM);
+        }
+        if (!frame)
+            r->eos_queued = 1;
     }
 
 send:
-    ret = rkmpp_send_frame(avctx, mpp_enc_frame);
-    if (ret == AVERROR(EAGAIN))
-        goto send;
-    else if (ret)
-        return ret;
+    mpp_enc_frame = get_oldest_unsent_frame(r->frame_list);
+    if (mpp_enc_frame &&
+        get_sent_frame_count(r->frame_list) <= r->async_frames) {
+        ret = rkmpp_send_frame(avctx, mpp_enc_frame);
+        if (ret == AVERROR(EAGAIN))
+            goto get;
+        else if (ret)
+            return ret;
+        mpp_enc_frame->sent = 1;
+    }
 
 get:
     ret = rkmpp_get_packet(avctx, packet, timeout);
-    if (!frame && ret == AVERROR(EAGAIN))
+    if (!frame && ret == AVERROR(EAGAIN) &&
+        get_oldest_unsent_frame(r->frame_list))
         goto send;
     if (ret == AVERROR_EOF ||
         ret == AVERROR(EAGAIN))
@@ -1083,6 +1111,8 @@ static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
     RKMPPEncContext *r = avctx->priv_data;
 
     r->cfg_init = 0;
+    r->eos_queued = 0;
+    r->frame_order = 0;
     r->async_frames = 0;
 
     if (r->mcfg) {
@@ -1145,6 +1175,8 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
     int ret;
 
     r->cfg_init = 0;
+    r->eos_queued = 0;
+    r->frame_order = 0;
     r->async_frames = 0;
 
     if ((coding_type = rkmpp_get_coding_type(avctx)) == MPP_VIDEO_CodingUnused) {
@@ -1252,7 +1284,7 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
             ret = AVERROR(ENOMEM);
             goto fail;
         }
-        avctx->extradata_size = pkt_len + AV_INPUT_BUFFER_PADDING_SIZE;
+        avctx->extradata_size = pkt_len;
         memcpy(avctx->extradata, pkt_pos, pkt_len);
         memset(avctx->extradata + pkt_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         mpp_packet_deinit(&mpp_pkt);
