@@ -562,7 +562,14 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
         (rc_mode == MPP_ENC_RC_MODE_CBR ||
          rc_mode == MPP_ENC_RC_MODE_VBR ||
          rc_mode == MPP_ENC_RC_MODE_AVBR)) {
-        int stats_time_in_sec = avctx->rc_buffer_size / max_bps;
+        int stats_time_in_sec;
+
+        if (max_bps <= 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Invalid bitrate max for rate control buffer size\n");
+            return AVERROR(EINVAL);
+        }
+        stats_time_in_sec = avctx->rc_buffer_size / max_bps;
         if (stats_time_in_sec > 0) {
             mpp_enc_cfg_set_u32(cfg, "rc:stats_time", stats_time_in_sec);
             av_log(avctx, AV_LOG_VERBOSE, "Stats time is set to %d\n", stats_time_in_sec);
