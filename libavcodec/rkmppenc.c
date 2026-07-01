@@ -73,6 +73,7 @@ static MppFrameFormat rkmpp_get_mpp_fmt_h26x(enum AVPixelFormat pix_fmt)
 static MppFrameFormat rkmpp_get_mpp_fmt_mjpeg(enum AVPixelFormat pix_fmt)
 {
     switch (pix_fmt) {
+    case AV_PIX_FMT_YUVJ420P:
     case AV_PIX_FMT_YUV420P:   return MPP_FMT_YUV420P;
     case AV_PIX_FMT_YUVJ422P:
     case AV_PIX_FMT_YUV422P:   return MPP_FMT_YUV422P;     /* RK3576+ only */
@@ -192,6 +193,44 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
         return AVERROR(EINVAL);
 
     return (*stride > 0) ? 0 : AVERROR(EINVAL);
+}
+
+static int rkmpp_check_drm_object0(AVCodecContext *avctx,
+                                   const AVDRMFrameDescriptor *desc)
+{
+    if (!desc ||
+        desc->nb_objects < 1 || desc->nb_objects > AV_DRM_MAX_PLANES ||
+        desc->nb_layers < 1 || desc->nb_layers > AV_DRM_MAX_PLANES) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid DRM frame descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    for (int i = 0; i < desc->nb_layers; i++) {
+        const AVDRMLayerDescriptor *layer = &desc->layers[i];
+
+        if (layer->nb_planes < 1 || layer->nb_planes > AV_DRM_MAX_PLANES) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid DRM layer descriptor\n");
+            return AVERROR(EINVAL);
+        }
+
+        for (int j = 0; j < layer->nb_planes; j++) {
+            int object_index = layer->planes[j].object_index;
+
+            if (object_index < 0 || object_index >= desc->nb_objects) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "Invalid DRM object index %d in layer %d plane %d\n",
+                       object_index, i, j);
+                return AVERROR(EINVAL);
+            }
+            if (object_index != 0) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "DRM frames split across multiple objects are not supported\n");
+                return AVERROR(ENOSYS);
+            }
+        }
+    }
+
+    return 0;
 }
 
 static unsigned get_sent_frame_count(MPPEncFrame *list)
@@ -321,6 +360,9 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR(EINVAL);
 
     drm_desc = (AVDRMFrameDescriptor *)frame->data[0];
+    ret = rkmpp_check_drm_object0(avctx, drm_desc);
+    if (ret < 0)
+        return ret;
     if (drm_desc->objects[0].fd < 0)
         return AVERROR(ENOMEM);
 
@@ -573,6 +615,8 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
             qp_init = r->qp_init >= 1 ? r->qp_init : 80;
             qp_max = r->qp_max >= 1 ? r->qp_max : 99;
             qp_min = r->qp_min >= 1 ? r->qp_min : 1;
+            qp_max_i = qp_max;
+            qp_min_i = qp_min;
             /* jpeg use special codec config to control qtable */
             mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", qp_init);
             mpp_enc_cfg_set_s32(cfg, "jpeg:qf_max", qp_max);
@@ -796,6 +840,9 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
     }
 
     drm_desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
+    ret = rkmpp_check_drm_object0(avctx, drm_desc);
+    if (ret < 0)
+        goto exit;
     if (drm_desc->objects[0].fd < 0)
         goto exit;
 
