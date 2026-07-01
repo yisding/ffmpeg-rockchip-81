@@ -225,6 +225,23 @@ static int nv24ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
     return srcSliceH;
 }
 
+static av_always_inline uint16_t nv15_20ToSample(const uint8_t *src,
+                                                 int sample, int shift)
+{
+    src += 5 * (sample >> 2);
+
+    switch (sample & 3) {
+    case 0:
+        return (((src[1] & 0x03) << 8) | (src[0] & 0xFF)) << shift;
+    case 1:
+        return (((src[2] & 0x0F) << 6) | ((src[1] >> 2) & 0x3F)) << shift;
+    case 2:
+        return (((src[3] & 0x3F) << 4) | ((src[2] >> 4) & 0x0F)) << shift;
+    default:
+        return (((src[4] & 0xFF) << 2) | ((src[3] >> 6) & 0x03)) << shift;
+    }
+}
+
 static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
                                   const int srcStride[], int srcSliceY,
                                   int srcSliceH, uint8_t *const dstParam[],
@@ -253,13 +270,8 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
     for (y = srcSliceH; y > 0; y--) {
         const uint8_t *tsrcY = srcY;
         uint16_t *tdstY = dstY;
-        for (x = c->opts.src_w / 4; x > 0; x--) {
-            *tdstY++ = (((tsrcY[1] & 0x3 ) << 8) | (tsrcY[0]        & 0xFF)) << shift[0];
-            *tdstY++ = (((tsrcY[2] & 0xF ) << 6) | ((tsrcY[1] >> 2) & 0x3F)) << shift[0];
-            *tdstY++ = (((tsrcY[3] & 0x3F) << 4) | ((tsrcY[2] >> 4) & 0xF )) << shift[0];
-            *tdstY++ = (((tsrcY[4] & 0xFF) << 2) | ((tsrcY[3] >> 6) & 0x3 )) << shift[0];
-            tsrcY += 5;
-        }
+        for (x = 0; x < c->opts.src_w; x++)
+            *tdstY++ = nv15_20ToSample(tsrcY, x, shift[0]);
         srcY += srcStride[0];
         dstY += dstStride[0] / sizeof(uint16_t);
     }
@@ -267,12 +279,9 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
     for (y = srcSliceH / vsub; y > 0; y--) {
         const uint8_t *tsrcUV = srcUV;
         uint16_t *tdstU = dstU, *tdstV = dstV;
-        for (x = c->chrSrcW / 2; x > 0; x--) {
-            *tdstU++ = (((tsrcUV[1] & 0x3 ) << 8) | (tsrcUV[0]        & 0xFF)) << shift[1];
-            *tdstV++ = (((tsrcUV[2] & 0xf ) << 6) | ((tsrcUV[1] >> 2) & 0x3F)) << shift[2];
-            *tdstU++ = (((tsrcUV[3] & 0x3F) << 4) | ((tsrcUV[2] >> 4) & 0xF )) << shift[1];
-            *tdstV++ = (((tsrcUV[4] & 0xFF) << 2) | ((tsrcUV[3] >> 6) & 0x3 )) << shift[2];
-            tsrcUV += 5;
+        for (x = 0; x < c->chrSrcW; x++) {
+            *tdstU++ = nv15_20ToSample(tsrcUV, 2 * x,     shift[1]);
+            *tdstV++ = nv15_20ToSample(tsrcUV, 2 * x + 1, shift[2]);
         }
         srcUV += srcStride[1];
         dstU += dstStride[1] / sizeof(uint16_t);

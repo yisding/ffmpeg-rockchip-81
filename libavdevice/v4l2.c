@@ -859,8 +859,8 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
                 av_err2str(ret), tpf->denominator, tpf->numerator);
         } else if (framerate_q.num && framerate_q.den) {
             // use user defined framerate for further error cases.
-            tpf->numerator   = framerate_q.num;
-            tpf->denominator = framerate_q.den;
+            tpf->numerator   = framerate_q.den;
+            tpf->denominator = framerate_q.num;
             av_log(ctx, AV_LOG_WARNING, "ioctl(VIDIOC_G_PARM): %s, using framerate %d/%d\n",
                 av_err2str(ret), framerate_q.num, framerate_q.den);
         } else {
