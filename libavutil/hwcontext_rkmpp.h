@@ -66,7 +66,7 @@
 #endif
 
 #define drm_is_afbc(mod) \
-        ((mod >> 52) == (DRM_FORMAT_MOD_ARM_TYPE_AFBC | \
+        (((mod) >> 52) == (DRM_FORMAT_MOD_ARM_TYPE_AFBC | \
                 (DRM_FORMAT_MOD_VENDOR_ARM << 4)))
 
 /* Rockchip RFBC (64x4) */
@@ -95,8 +95,8 @@
 	DRM_FORMAT_MOD_ROCKCHIP_CODE(DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC, mode)
 
 #define drm_is_rfbc(mod) \
-        (((mod >> 56) & 0xff) == DRM_FORMAT_MOD_VENDOR_ROCKCHIP) && \
-        (((mod >> 52) & DRM_FORMAT_MOD_ROCKCHIP_TYPE_MASK) == DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC)
+        (((((mod) >> 56) & 0xff) == DRM_FORMAT_MOD_VENDOR_ROCKCHIP) && \
+         ((((mod) >> 52) & DRM_FORMAT_MOD_ROCKCHIP_TYPE_MASK) == DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC))
 
 /**
  * DRM Prime Frame descriptor for RKMPP HWDevice.

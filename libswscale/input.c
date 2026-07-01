@@ -2065,7 +2065,7 @@ av_cold void ff_sws_init_input_funcs(SwsInternal *c,
         break;
     case AV_PIX_FMT_NV15:
     case AV_PIX_FMT_NV20_PACKED:
-        c->chrToYV12 = nv15_20ToUV_c;
+        *chrToYV12 = nv15_20ToUV_c;
         break;
     case AV_PIX_FMT_P010LE:
     case AV_PIX_FMT_P210LE:
@@ -2657,7 +2657,7 @@ av_cold void ff_sws_init_input_funcs(SwsInternal *c,
         break;
     case AV_PIX_FMT_NV15:
     case AV_PIX_FMT_NV20_PACKED:
-        c->lumToYV12 = nv15_20ToY_c;
+        *lumToYV12 = nv15_20ToY_c;
         break;
     case AV_PIX_FMT_P010LE:
     case AV_PIX_FMT_P210LE:
