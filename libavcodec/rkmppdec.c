@@ -119,14 +119,19 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
 static void read_soc_name(AVCodecContext *avctx, char *name, int size)
 {
     const char *dt_path = "/proc/device-tree/compatible";
-    int fd = open(dt_path, O_RDONLY);
+    int fd;
 
+    if (size <= 0)
+        return;
+
+    snprintf(name, size, "unknown");
+
+    fd = open(dt_path, O_RDONLY);
     if (fd < 0) {
         av_log(avctx, AV_LOG_VERBOSE, "Unable to open '%s' for reading SoC name\n", dt_path);
     } else {
         ssize_t soc_name_len = 0;
 
-        snprintf(name, size - 1, "unknown");
         soc_name_len = read(fd, name, size - 1);
         if (soc_name_len > 0) {
             name[soc_name_len] = '\0';
@@ -977,9 +982,17 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
     }
     mpp_packet_set_eos(mpp_pkt);
 
-    do {
-        ret = r->mapi->decode_put_packet(r->mctx, mpp_pkt);
-    } while (ret != MPP_OK);
+    ret = r->mapi->decode_put_packet(r->mctx, mpp_pkt);
+    if (ret != MPP_OK) {
+        int log_level = (ret == MPP_NOK ||
+                         ret == MPP_ERR_BUFFER_FULL) ? AV_LOG_TRACE : AV_LOG_ERROR;
+        int err = (ret == MPP_NOK ||
+                   ret == MPP_ERR_BUFFER_FULL) ? AVERROR(EAGAIN) : AVERROR_EXTERNAL;
+
+        av_log(avctx, log_level, "Failed to put EOS packet to decoder input queue: %d\n", ret);
+        mpp_packet_deinit(&mpp_pkt);
+        return err;
+    }
 
     r->draining = 1;
 
@@ -1168,7 +1181,9 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             if (ret == AVERROR_EOF) {
                 av_log(avctx, AV_LOG_DEBUG, "Decoder is at EOF\n");
                 /* send EOS and start draining */
-                rkmpp_send_eos(avctx);
+                ret = rkmpp_send_eos(avctx);
+                if (ret < 0 && ret != AVERROR(EAGAIN))
+                    goto exit;
                 ret = rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_BLOCK);
                 goto exit;
             } else if (ret == AVERROR(EAGAIN)) {
