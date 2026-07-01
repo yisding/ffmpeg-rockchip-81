@@ -216,8 +216,11 @@ static av_cold int set_size_info(AVFilterContext *ctx,
     r->act_w = FFMIN(r->act_w, inlink->w - r->act_x);
     r->act_h = FFMIN(r->act_h, inlink->h - r->act_y);
 
-    ff_scale_adjust_dimensions(inlink, &w, &h,
-                               r->force_original_aspect_ratio, r->force_divisible_by);
+    ret = ff_scale_adjust_dimensions(inlink, &w, &h,
+                                     r->force_original_aspect_ratio,
+                                     r->force_divisible_by, 1.0);
+    if (ret < 0)
+        return ret;
 
     if (((int64_t)h * inlink->w) > INT_MAX ||
         ((int64_t)w * inlink->h) > INT_MAX) {
@@ -346,17 +349,18 @@ static av_cold int rgavpp_config_props(AVFilterLink *outlink)
     AVFilterContext *ctx = outlink->src;
     RGAVppContext     *r = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink      *inl = ff_filter_link(inlink);
     AVHWFramesContext *in_frames_ctx;
     enum AVPixelFormat in_format;
     enum AVPixelFormat out_format;
     RKRGAParam param = { NULL };
     int ret;
 
-    if (!inlink->hw_frames_ctx) {
+    if (!inl->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw context provided on input\n");
         return AVERROR(EINVAL);
     }
-    in_frames_ctx = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
+    in_frames_ctx = (AVHWFramesContext *)inl->hw_frames_ctx->data;
     in_format     = in_frames_ctx->sw_format;
     out_format    = (r->format == AV_PIX_FMT_NONE) ? in_format : r->format;
 
@@ -534,7 +538,7 @@ const FFFilter ff_vf_scale_rkrga = {
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
     .activate       = rgavpp_activate,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
-    .flags          = AVFILTER_FLAG_HWDEVICE,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
 };
 
 #endif
@@ -575,7 +579,7 @@ const FFFilter ff_vf_vpp_rkrga = {
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
     .activate       = rgavpp_activate,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
-    .flags          = AVFILTER_FLAG_HWDEVICE,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
 };
 
 #endif
