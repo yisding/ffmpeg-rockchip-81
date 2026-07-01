@@ -50,7 +50,9 @@ typedef struct MPPEncFrame {
     MppFrame            mpp_frame;
     MppEncUserDataSet   mpp_sei_set;
     struct MPPEncFrame *next;
+    int64_t             order;
     int                 queued;
+    int                 sent;
 } MPPEncFrame;
 
 typedef struct RKMPPEncContext {
@@ -68,7 +70,9 @@ typedef struct RKMPPEncContext {
     enum AVPixelFormat pix_fmt;
 
     MPPEncFrame       *frame_list;
+    int64_t            frame_order;
     int                async_frames;
+    int                eos_queued;
 
     int                rc_mode;
     int                qp_init;
