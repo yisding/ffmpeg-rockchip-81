@@ -408,6 +408,7 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
 
     if (desc->drm_desc.objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
         av_log(hwfc, AV_LOG_ERROR, "Transfer non-linear DRM_PRIME frame is not supported!\n");
+        av_free(map);
         return AVERROR(ENOSYS);
     }
 
