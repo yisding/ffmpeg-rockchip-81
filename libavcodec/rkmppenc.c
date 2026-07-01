@@ -820,6 +820,8 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
     if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
         drm_frame = frame;
         mpp_enc_frame->frame = av_frame_clone(drm_frame);
+        if (!mpp_enc_frame->frame)
+            goto exit;
     } else {
         AVBufferRef *hw_frames_ctx = frame->hw_frames_ctx;
 
@@ -976,6 +978,24 @@ exit:
         av_frame_free(&drm_frame);
     }
 
+    /* fully unwind the list entry: a partially initialized (bufferless)
+     * MppFrame left queued would later be picked by
+     * get_oldest_unsent_frame and sent to the encoder, and could never
+     * be reclaimed by clear_unused_frames */
+    if (mpp_enc_frame) {
+        if (mpp_buf)
+            mpp_buffer_put(mpp_buf);
+        if (mpp_enc_frame->mpp_frame)
+            mpp_frame_deinit(&mpp_enc_frame->mpp_frame);
+
+        av_freep(&mpp_enc_frame->mpp_sei_set.datas);
+        mpp_enc_frame->mpp_sei_set.count = 0;
+
+        av_frame_free(&mpp_enc_frame->frame);
+        mpp_enc_frame->queued = 0;
+        mpp_enc_frame->sent = 0;
+    }
+
     return NULL;
 }
 
@@ -1093,17 +1113,28 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
         ret = AVERROR(ENOMEM);
         goto exit;
     }
-
-    /* mark buffer as unused (idx < 0) */
-    mpp_buffer_set_index(mpp_buf, -1);
-    clear_unused_frames(r->frame_list);
-
-    mpp_packet_deinit(&mpp_pkt);
-    return 0;
+    ret = 0;
 
 exit:
-    if (mpp_pkt)
+    if (mpp_pkt) {
+        /* return the consumed input frame's buffer to the pool even when
+         * bailing out on error, otherwise it stays pinned forever */
+        if (!mpp_buf) {
+            if (!mpp_meta)
+                mpp_meta = mpp_packet_get_meta(mpp_pkt);
+            if (mpp_meta && !mpp_frame)
+                mpp_meta_get_frame(mpp_meta, KEY_INPUT_FRAME, &mpp_frame);
+            if (mpp_frame)
+                mpp_buf = mpp_frame_get_buffer(mpp_frame);
+        }
+        if (mpp_buf) {
+            /* mark buffer as unused (idx < 0) */
+            mpp_buffer_set_index(mpp_buf, -1);
+            clear_unused_frames(r->frame_list);
+        }
+
         mpp_packet_deinit(&mpp_pkt);
+    }
 
     return ret;
 }

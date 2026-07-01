@@ -437,6 +437,8 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         return NULL;
     }
     rga_frame->frame = av_frame_clone(picref);
+    if (!rga_frame->frame)
+        return NULL;
 
     desc = (AVDRMFrameDescriptor *)rga_frame->frame->data[0];
     if (desc->objects[0].fd < 0)
@@ -1340,13 +1342,12 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         set_rga_async_frame_lock_status(&aframe, 0);
 
         filter_ret = r->filter_frame(outlink, aframe.dst->frame);
-        if (filter_ret < 0) {
-            av_frame_free(&aframe.dst->frame);
-            return filter_ret;
-        }
-        aframe.dst->queued--;
-        r->got_frame = 1;
+        /* ff_filter_frame consumes the frame even on failure */
         aframe.dst->frame = NULL;
+        aframe.dst->queued--;
+        if (filter_ret < 0)
+            return filter_ret;
+        r->got_frame = 1;
     }
 
     if (!picref_src)
@@ -1437,13 +1438,12 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         set_rga_async_frame_lock_status(&aframe, 0);
 
         filter_ret = r->filter_frame(outlink, aframe.dst->frame);
-        if (filter_ret < 0) {
-            av_frame_free(&aframe.dst->frame);
-            return filter_ret;
-        }
-        aframe.dst->queued--;
-        r->got_frame = 1;
+        /* ff_filter_frame consumes the frame even on failure */
         aframe.dst->frame = NULL;
+        aframe.dst->queued--;
+        if (filter_ret < 0)
+            return filter_ret;
+        r->got_frame = 1;
     }
 
     return 0;

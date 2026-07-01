@@ -216,7 +216,7 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
     const int aligned_h = FFALIGN(hwfc->height * 5 / 4, 64);
 
     MppBuffer mpp_buf = NULL;
-    size_t mpp_buf_size = aligned_w * aligned_h * bits_pp / 8;
+    size_t mpp_buf_size = (size_t)aligned_w * aligned_h * bits_pp / 8;
 
     if (hwfc->initial_pool_size > 0 &&
         avfc->nb_frames >= hwfc->initial_pool_size)
