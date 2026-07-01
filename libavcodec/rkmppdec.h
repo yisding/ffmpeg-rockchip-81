@@ -32,6 +32,7 @@
 
 #include "codec_internal.h"
 #include "decode.h"
+#include "decode_bsf.h"
 #include "hwconfig.h"
 #include "internal.h"
 
@@ -62,6 +63,8 @@ typedef struct RKMPPDecContext {
     int            info_change;
     int            got_frame;
     int            use_rfbc;
+    int            extradata_sent;
+    int            frames_pending;
 
     int            deint;
     int            afbc;
