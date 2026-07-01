@@ -165,6 +165,8 @@ static av_cold int rgaoverlay_config_props(AVFilterLink *outlink)
     RGAOverlayContext *r = ctx->priv;
     AVFilterLink *inlink_main    = ctx->inputs[0];
     AVFilterLink *inlink_overlay = ctx->inputs[1];
+    FilterLink *inl_main         = ff_filter_link(inlink_main);
+    FilterLink *inl_overlay      = ff_filter_link(inlink_overlay);
     AVHWFramesContext *frames_ctx_main;
     AVHWFramesContext *frames_ctx_overlay;
     enum AVPixelFormat in_format_main;
@@ -174,19 +176,19 @@ static av_cold int rgaoverlay_config_props(AVFilterLink *outlink)
 
     RKRGAParam param = { NULL };
 
-    if (!inlink_main->hw_frames_ctx) {
+    if (!inl_main->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw context provided on main input\n");
         return AVERROR(EINVAL);
     }
-    frames_ctx_main = (AVHWFramesContext *)inlink_main->hw_frames_ctx->data;
+    frames_ctx_main = (AVHWFramesContext *)inl_main->hw_frames_ctx->data;
     in_format_main  = frames_ctx_main->sw_format;
     out_format      = (r->format == AV_PIX_FMT_NONE) ? in_format_main : r->format;
 
-    if (!inlink_overlay->hw_frames_ctx) {
+    if (!inl_overlay->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw context provided on overlay input\n");
         return AVERROR(EINVAL);
     }
-    frames_ctx_overlay = (AVHWFramesContext *)inlink_overlay->hw_frames_ctx->data;
+    frames_ctx_overlay = (AVHWFramesContext *)inl_overlay->hw_frames_ctx->data;
     in_format_overlay  = frames_ctx_overlay->sw_format;
 
     ret = set_size_info(ctx, inlink_main, inlink_overlay, outlink);
@@ -371,5 +373,5 @@ const FFFilter ff_vf_overlay_rkrga = {
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
     .preinit        = rgaoverlay_framesync_preinit,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
-    .flags          = AVFILTER_FLAG_HWDEVICE,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
 };
