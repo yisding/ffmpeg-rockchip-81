@@ -952,8 +952,7 @@ static av_always_inline void nv15_20ToYUV_c(uint16_t *dst, const uint8_t *src,
     int shift = (src_pos << 1) & 7;
     src_pos = (src_pos * 10) >> 3;
     AV_WN16(dst + dst_pos,
-            ((AV_RL16(src + src_pos) >> shift) |
-             (AV_RL16(src + src_pos + 1) << (8 - shift))) & 0x3FF);
+            (AV_RL16(src + src_pos) >> shift) & 0x3FF);
 }
 
 static void nv15_20ToY_c(uint8_t *_dst, const uint8_t *_src, const uint8_t *unused1,

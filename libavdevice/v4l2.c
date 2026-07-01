@@ -580,6 +580,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         .length   = s->multiplanar ? VIDEO_MAX_PLANES : 0,
     };
     struct timeval buf_ts;
+    unsigned int plane_payload[VIDEO_MAX_PLANES] = { 0 };
     unsigned int bytesused = 0;
     int res;
 
@@ -608,8 +609,21 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     av_assert0(atomic_load(&s->buffers_queued) >= 1);
 
     if (s->multiplanar) {
-        for (int plane = 0; plane < buf.length; plane++)
-            bytesused += buf.m.planes[plane].bytesused;
+        for (int plane = 0; plane < buf.length; plane++) {
+            if (buf.m.planes[plane].bytesused < buf.m.planes[plane].data_offset) {
+                av_log(ctx, AV_LOG_ERROR,
+                       "Dequeued v4l2 buffer plane %d contains %u bytes, "
+                       "below data offset %u.\n",
+                       plane, buf.m.planes[plane].bytesused,
+                       buf.m.planes[plane].data_offset);
+                res = enqueue_buffer(s, &buf);
+                return res ? res : AVERROR(EINVAL);
+            }
+
+            plane_payload[plane] = buf.m.planes[plane].bytesused -
+                                   buf.m.planes[plane].data_offset;
+            bytesused += plane_payload[plane];
+        }
     } else {
         bytesused = buf.bytesused;
     }
@@ -621,8 +635,10 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
                bytesused);
         bytesused = 0;
         if (s->multiplanar) {
-            for (int plane = 0; plane < buf.length; plane++)
+            for (int plane = 0; plane < buf.length; plane++) {
+                plane_payload[plane] = 0;
                 buf.m.planes[plane].bytesused = 0;
+            }
         } else {
             buf.bytesused = 0;
         }
@@ -640,8 +656,10 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
                    bytesused, s->frame_size, buf.flags);
             bytesused = 0;
             if (s->multiplanar) {
-                for (int plane = 0; plane < buf.length; plane++)
+                for (int plane = 0; plane < buf.length; plane++) {
+                    plane_payload[plane] = 0;
                     buf.m.planes[plane].bytesused = 0;
+                }
             } else {
                 buf.bytesused = 0;
             }
@@ -662,10 +680,13 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
             unsigned int offset = 0;
 
             for (int plane = 0; plane < buf.length; plane++) {
-                memcpy(pkt->data + offset,
-                       (uint8_t *)s->buf_data[buf.index].start[plane] + buf.m.planes[plane].data_offset,
-                       buf.m.planes[plane].bytesused);
-                offset += buf.m.planes[plane].bytesused;
+                if (plane_payload[plane]) {
+                    memcpy(pkt->data + offset,
+                           (uint8_t *)s->buf_data[buf.index].start[plane] +
+                           buf.m.planes[plane].data_offset,
+                           plane_payload[plane]);
+                    offset += plane_payload[plane];
+                }
             }
         } else {
             memcpy(pkt->data, s->buf_data[buf.index].start[0], bytesused);
