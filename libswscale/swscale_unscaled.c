@@ -255,6 +255,7 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
     uint16_t *dstV = (uint16_t*)(dstParam[2] + dstStride[2] * srcSliceY / vsub);
     const uint8_t *srcY = src[0];
     const uint8_t *srcUV = src[1];
+    int chrSrcSliceH = (srcSliceH + vsub - 1) / vsub;
     int x, y;
 
     /* Calculate net shift required for values. */
@@ -276,7 +277,7 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
         dstY += dstStride[0] / sizeof(uint16_t);
     }
 
-    for (y = srcSliceH / vsub; y > 0; y--) {
+    for (y = chrSrcSliceH; y > 0; y--) {
         const uint8_t *tsrcUV = srcUV;
         uint16_t *tdstU = dstU, *tdstV = dstV;
         for (x = 0; x < c->chrSrcW; x++) {
