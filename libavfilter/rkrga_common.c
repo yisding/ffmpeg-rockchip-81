@@ -590,7 +590,10 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         av_log(ctx, AV_LOG_ERROR, "Failed to copy metadata fields from in to out: %d\n", ret);
         goto fail;
     }
-    out_frame->frame->crop_top = 0;
+    out_frame->frame->crop_top    = 0;
+    out_frame->frame->crop_bottom = 0;
+    out_frame->frame->crop_left   = 0;
+    out_frame->frame->crop_right  = 0;
     if ((in0_info->rotate_mode & 0x04) == 0x04 /* HAL_TRANSFORM_ROT_90 */ ||
         (in0_info->rotate_mode & 0x07) == 0x07 /* HAL_TRANSFORM_ROT_270 */) {
         av_reduce(&out_frame->frame->sample_aspect_ratio.den,
