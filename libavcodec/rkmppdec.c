@@ -999,6 +999,7 @@ export:
             {
                 if ((ret = rkmpp_export_frame(avctx, frame, mpp_frame)) < 0)
                     goto exit;
+                mpp_frame = NULL;
                 return 0;
             }
             break;
@@ -1015,6 +1016,7 @@ export:
                 }
                 if ((ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame)) < 0)
                     goto exit;
+                mpp_frame = NULL;
 
                 if ((ret = ff_get_buffer(avctx, frame, 0)) < 0) {
                     av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed: %d\n", ret);
