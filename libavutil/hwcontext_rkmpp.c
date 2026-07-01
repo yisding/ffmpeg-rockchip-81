@@ -197,7 +197,6 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
     int ret;
     AVHWFramesContext *hwfc = opaque;
     AVRKMPPFramesContext *avfc = hwfc->hwctx;
-    AVRKMPPDeviceContext *hwctx = hwfc->device_ctx->hwctx;
     AVRKMPPDRMFrameDescriptor *desc;
     AVDRMLayerDescriptor *layer;
     AVBufferRef *ref;
@@ -224,7 +223,7 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
 
     ret = mpp_buffer_get(avfc->buf_group, &mpp_buf, mpp_buf_size);
     if (ret != MPP_OK || !mpp_buf) {
-        av_log(hwctx, AV_LOG_ERROR, "Failed to get MPP buffer: %d\n", ret);
+        av_log(hwfc, AV_LOG_ERROR, "Failed to get MPP buffer: %d\n", ret);
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -562,7 +561,9 @@ static int rkmpp_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
 {
     int err;
 
-    if (hwfc->sw_format != dst->format)
+    if (dst->format == AV_PIX_FMT_NONE)
+        dst->format = hwfc->sw_format;
+    if (dst->format != hwfc->sw_format)
         return AVERROR(ENOSYS);
 
     err = rkmpp_map_frame(hwfc, dst, src, flags);

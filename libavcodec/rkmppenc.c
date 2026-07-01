@@ -1030,7 +1030,7 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
         return ret;
     }
     if (!mpp_pkt)
-        return AVERROR(ENOMEM);
+        return AVERROR(EAGAIN);
 
     if (mpp_packet_get_eos(mpp_pkt)) {
         av_log(avctx, AV_LOG_DEBUG, "Received an EOS packet\n");
