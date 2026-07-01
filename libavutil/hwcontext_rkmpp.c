@@ -142,6 +142,14 @@ static int rkmpp_frames_get_constraints(AVHWDeviceContext *hwdev,
     return 0;
 }
 
+static int rkmpp_frames_get_buffer_flags(AVHWFramesContext *hwfc)
+{
+    AVRKMPPDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    AVRKMPPFramesContext *avfc = hwfc->hwctx;
+
+    return hwctx->flags | avfc->flags;
+}
+
 static void rkmpp_free_drm_frame_descriptor(void *opaque, uint8_t *data)
 {
     MppBuffer mpp_buf = opaque;
@@ -277,7 +285,6 @@ fail:
 static int rkmpp_frames_init(AVHWFramesContext *hwfc)
 {
     AVRKMPPFramesContext *avfc = hwfc->hwctx;
-    AVRKMPPDeviceContext *hwctx = hwfc->device_ctx->hwctx;
     int i, ret;
 
     if (hwfc->pool)
@@ -302,7 +309,8 @@ static int rkmpp_frames_init(AVHWFramesContext *hwfc)
     }
 
     ret = mpp_buffer_group_get_internal(&avfc->buf_group,
-                                        MPP_BUFFER_TYPE_DRM | hwctx->flags | avfc->flags);
+                                        MPP_BUFFER_TYPE_DRM |
+                                        rkmpp_frames_get_buffer_flags(hwfc));
     if (ret != MPP_OK) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to get MPP internal buffer group: %d\n", ret);
         return AVERROR_EXTERNAL;
@@ -350,6 +358,7 @@ typedef struct RKMPPDRMMapping {
     // Address and length of each mmap()ed region.
     int nb_regions;
     int sync_flags;
+    int buffer_flags;
     int object[AV_DRM_MAX_PLANES];
     void *address[AV_DRM_MAX_PLANES];
     size_t length[AV_DRM_MAX_PLANES];
@@ -359,13 +368,14 @@ typedef struct RKMPPDRMMapping {
 static void rkmpp_unmap_frame(AVHWFramesContext *hwfc,
                               HWMapDescriptor *hwmap)
 {
-    AVRKMPPFramesContext *avfc = hwfc->hwctx;
     RKMPPDRMMapping *map = hwmap->priv;
+
+    (void)hwfc;
 
     for (int i = 0; i < map->nb_regions; i++) {
 #if HAVE_LINUX_DMA_BUF_H
         struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | map->sync_flags };
-        if (avfc->flags & MPP_BUFFER_FLAGS_CACHABLE)
+        if (map->buffer_flags & MPP_BUFFER_FLAGS_CACHABLE)
             ioctl(map->object[i], DMA_BUF_IOCTL_SYNC, &sync);
 #endif
         if (map->address[i] && map->unmap[i])
@@ -378,7 +388,6 @@ static void rkmpp_unmap_frame(AVHWFramesContext *hwfc,
 static int rkmpp_map_frame(AVHWFramesContext *hwfc,
                            AVFrame *dst, const AVFrame *src, int flags)
 {
-    AVRKMPPFramesContext *avfc = hwfc->hwctx;
     const AVRKMPPDRMFrameDescriptor *desc = (AVRKMPPDRMFrameDescriptor *)src->data[0];
 #if HAVE_LINUX_DMA_BUF_H
     struct dma_buf_sync sync_start = { 0 };
@@ -391,6 +400,7 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     map = av_mallocz(sizeof(*map));
     if (!map)
         return AVERROR(ENOMEM);
+    map->buffer_flags = rkmpp_frames_get_buffer_flags(hwfc);
 
     mmap_prot = 0;
     if (flags & AV_HWFRAME_MAP_READ)
@@ -439,7 +449,7 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
 #if HAVE_LINUX_DMA_BUF_H
         /* We're not checking for errors here because the kernel may not
          * support the ioctl, in which case its okay to carry on */
-        if (avfc->flags & MPP_BUFFER_FLAGS_CACHABLE)
+        if (map->buffer_flags & MPP_BUFFER_FLAGS_CACHABLE)
             ioctl(desc->drm_desc.objects[i].fd, DMA_BUF_IOCTL_SYNC, &sync_start);
 #endif
     }
