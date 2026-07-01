@@ -28,11 +28,13 @@
 #include "config.h"
 #include "config_components.h"
 
+#include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 
 #include "rkmppdec.h"
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
 #if CONFIG_RKRGA
@@ -90,6 +92,85 @@ static uint32_t rkmpp_get_av_format(MppFrameFormat mpp_fmt)
     case MPP_FMT_YUV444SP:          return AV_PIX_FMT_NV24;
     default:                        return AV_PIX_FMT_NONE;
     }
+}
+
+static int rkmpp_mjpeg_is_sof_marker(int marker)
+{
+    return marker >= 0xc0 && marker <= 0xcf &&
+           marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+}
+
+static int rkmpp_mjpeg_parse_dimensions(const uint8_t *buf, int buf_size,
+                                        int *width, int *height)
+{
+    const uint8_t *end = buf + buf_size;
+
+    while (buf + 1 < end) {
+        int marker, len;
+
+        while (buf < end && *buf != 0xff)
+            buf++;
+        if (buf + 1 >= end)
+            break;
+
+        buf++;
+        while (buf < end && *buf == 0xff)
+            buf++;
+        if (buf >= end)
+            break;
+
+        marker = *buf++;
+        if (marker == 0x00)
+            continue;
+        if (marker == 0xd8 || marker == 0xd9 || marker == 0x01 ||
+            (marker >= 0xd0 && marker <= 0xd7))
+            continue;
+        if (buf + 2 > end)
+            break;
+
+        len = AV_RB16(buf);
+        if (len < 2 || len > end - buf)
+            break;
+        if (rkmpp_mjpeg_is_sof_marker(marker)) {
+            if (len < 7)
+                break;
+            *height = AV_RB16(buf + 3);
+            *width  = AV_RB16(buf + 5);
+            return *width > 0 && *height > 0;
+        }
+        if (marker == 0xda)
+            break;
+
+        buf += len;
+    }
+
+    return 0;
+}
+
+static int rkmpp_mjpeg_output_buffer_size(AVCodecContext *avctx,
+                                          const AVPacket *pkt, size_t *buf_sz)
+{
+    int width = avctx->width > 0 ? avctx->width : avctx->coded_width;
+    int height = avctx->height > 0 ? avctx->height : avctx->coded_height;
+    uint64_t aligned_width, aligned_height;
+
+    if ((width <= 0 || height <= 0) && pkt->data && pkt->size > 0)
+        rkmpp_mjpeg_parse_dimensions(pkt->data, pkt->size, &width, &height);
+
+    if (width <= 0 || height <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to determine MJPEG dimensions\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    aligned_width  = FFALIGN((uint64_t)width,  16);
+    aligned_height = FFALIGN((uint64_t)height, 16);
+    if (aligned_width > SIZE_MAX / 4 / aligned_height) {
+        av_log(avctx, AV_LOG_ERROR, "MJPEG output buffer size is too large\n");
+        return AVERROR(EINVAL);
+    }
+
+    *buf_sz = aligned_width * aligned_height * 4;
+    return 0;
 }
 
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
@@ -1001,14 +1082,14 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
     return 0;
 }
 
-static int rkmpp_mjpeg_put_packet(AVCodecContext *avctx, MppPacket mpp_pkt_with_buf)
+static int rkmpp_mjpeg_put_packet(AVCodecContext *avctx, MppPacket mpp_pkt_with_buf,
+                                  size_t buf_sz)
 {
     RKMPPDecContext *r = avctx->priv_data;
     MppBufferGroup buf_group = r->buf_group ? r->buf_group : r->buf_group_misc;
     MppBuffer mpp_buf = NULL;
     MppFrame mpp_frame = NULL;
     MppMeta pkt_meta = NULL;
-    size_t buf_sz = FFALIGN(avctx->width, 16) * FFALIGN(avctx->height, 16) << 2;
     int ret;
 
     av_assert0(buf_group);
@@ -1097,8 +1178,12 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
 
     if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
         MppBuffer mpp_buf = NULL;
+        size_t buf_sz;
 
         av_assert0(r->buf_group_misc);
+
+        if ((ret = rkmpp_mjpeg_output_buffer_size(avctx, pkt, &buf_sz)) < 0)
+            return ret;
 
         /* the input slot of the MJPEG decoder must be a DRM/DMA buffer,
          * so borrow some from the frame buffer to write the pkt data */
@@ -1125,7 +1210,7 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
         mpp_buffer_put(mpp_buf);
         mpp_packet_set_pts(mpp_pkt, mpp_pkt_pts);
 
-        ret = rkmpp_mjpeg_put_packet(avctx, mpp_pkt);
+        ret = rkmpp_mjpeg_put_packet(avctx, mpp_pkt, buf_sz);
         if (ret == MPP_ERR_UNKNOW) {
             if (mpp_pkt)
                 mpp_packet_deinit(&mpp_pkt);
