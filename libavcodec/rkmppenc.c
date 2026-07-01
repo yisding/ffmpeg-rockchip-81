@@ -970,8 +970,11 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
 
 exit:
     if (drm_frame &&
-        avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME)
+        avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME) {
+        if (mpp_enc_frame && mpp_enc_frame->frame == drm_frame)
+            mpp_enc_frame->frame = NULL;
         av_frame_free(&drm_frame);
+    }
 
     return NULL;
 }
