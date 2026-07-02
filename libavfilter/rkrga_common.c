@@ -26,6 +26,7 @@
 #include <inttypes.h>
 
 #include "libavutil/common.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 
@@ -126,12 +127,13 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
                             const AVDRMLayerDescriptor *layer,
                             enum AVPixelFormat pix_fmt,
                             int is_rgb, int is_planar,
-                            float bytes_pp, int *ws, int *hs)
+                            int width, int height,
+                            int *ws, int *hs)
 {
     const AVDRMPlaneDescriptor *plane0, *plane1;
     const int is_packed_fmt = is_rgb || (!is_rgb && !is_planar);
 
-    if (!object || !layer || !ws || !hs || bytes_pp <= 0)
+    if (!object || !layer || !ws || !hs || width <= 0 || height <= 0)
         return AVERROR(EINVAL);
 
     plane0 = &layer->planes[0];
@@ -141,7 +143,39 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
         return AVERROR(EINVAL);
 
     if (is_packed_fmt) {
-        *ws = plane0->pitch / bytes_pp;
+        int min_linesize = av_image_get_linesize(pix_fmt, width, 0);
+
+        if (min_linesize < 0)
+            return min_linesize;
+        if (plane0->pitch < min_linesize)
+            return AVERROR(EINVAL);
+        switch (pix_fmt) {
+        case AV_PIX_FMT_GRAY8:
+            *ws = plane0->pitch;
+            break;
+        case AV_PIX_FMT_RGB555LE:
+        case AV_PIX_FMT_BGR555LE:
+        case AV_PIX_FMT_RGB565LE:
+        case AV_PIX_FMT_BGR565LE:
+        case AV_PIX_FMT_YUYV422:
+        case AV_PIX_FMT_YVYU422:
+        case AV_PIX_FMT_UYVY422:
+            if (plane0->pitch % 2)
+                return AVERROR(EINVAL);
+            *ws = plane0->pitch / 2;
+            break;
+        case AV_PIX_FMT_RGB24:
+        case AV_PIX_FMT_BGR24:
+            if (plane0->pitch % 3)
+                return AVERROR(EINVAL);
+            *ws = plane0->pitch / 3;
+            break;
+        default:
+            if (plane0->pitch % 4)
+                return AVERROR(EINVAL);
+            *ws = plane0->pitch / 4;
+            break;
+        }
     } else {
         switch (pix_fmt) {
         case AV_PIX_FMT_P010:
@@ -164,8 +198,14 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
     *hs = is_packed_fmt ?
         ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2) :
         (plane1->offset / plane0->pitch);
+    if (!is_packed_fmt && plane1->offset % plane0->pitch)
+        return AVERROR(EINVAL);
 
-    return (*ws > 0 && *hs > 0) ? 0 : AVERROR(EINVAL);
+    if (*ws <= 0 || *hs <= 0 ||
+        *ws < width || *hs < height)
+        return AVERROR(EINVAL);
+
+    return 0;
 }
 
 static int get_single_drm_object_index(const AVDRMFrameDescriptor *desc,
@@ -224,18 +264,6 @@ static uint32_t get_drm_afbc_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_RGB0:     return DRM_FORMAT_XBGR8888;
     case AV_PIX_FMT_BGRA:     return DRM_FORMAT_ARGB8888;
     case AV_PIX_FMT_BGR0:     return DRM_FORMAT_XRGB8888;
-    default:                  return DRM_FORMAT_INVALID;
-    }
-}
-
-static uint32_t get_drm_rfbc_format(enum AVPixelFormat pix_fmt)
-{
-    switch (pix_fmt) {
-    case AV_PIX_FMT_NV12:     return DRM_FORMAT_YUV420_8BIT;
-    case AV_PIX_FMT_NV15:     return DRM_FORMAT_YUV420_10BIT;
-    case AV_PIX_FMT_NV16:     return DRM_FORMAT_YUYV;
-    case AV_PIX_FMT_NV20_PACKED: return DRM_FORMAT_Y210;
-    case AV_PIX_FMT_NV24:     return DRM_FORMAT_VUY888;
     default:                  return DRM_FORMAT_INVALID;
     }
 }
@@ -357,6 +385,25 @@ static int validate_rga3_pixel_stride(AVFilterContext *avctx,
     return AVERROR(EINVAL);
 }
 
+static int validate_active_rect_stride(AVFilterContext *avctx,
+                                       const RGAFrameInfo *info,
+                                       int ws, int hs, const char *role)
+{
+    if (!info || ws <= 0 || hs <= 0 ||
+        info->act_x < 0 || info->act_y < 0 ||
+        info->act_w <= 0 || info->act_h <= 0 ||
+        info->act_x > ws - info->act_w ||
+        info->act_y > hs - info->act_h) {
+        av_log(avctx, AV_LOG_ERROR,
+               "%s active rectangle %dx%d@%d,%d exceeds stride %dx%d\n",
+               role, info ? info->act_w : 0, info ? info->act_h : 0,
+               info ? info->act_x : 0, info ? info->act_y : 0, ws, hs);
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
 static int is_yuv_rect_aligned(const RGAFrameInfo *info, int x, int y, int w, int h)
 {
     return (info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB) ||
@@ -402,24 +449,15 @@ static int is_supported_afbc_modifier(uint64_t modifier)
                                                AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
 }
 
-static int is_supported_rfbc_modifier(uint64_t modifier)
-{
-    return modifier == DRM_FORMAT_MOD_ROCKCHIP_RFBC(ROCKCHIP_RFBC_BLOCK_SIZE_64x4);
-}
-
 static int validate_drm_modifier(AVFilterContext *avctx, uint64_t modifier,
-                                 int *is_afbc, int *is_rfbc)
+                                 int *is_afbc)
 {
-    *is_afbc = *is_rfbc = 0;
+    *is_afbc = 0;
 
     if (modifier == DRM_FORMAT_MOD_LINEAR)
         return 0;
     if (is_supported_afbc_modifier(modifier)) {
         *is_afbc = 1;
-        return 0;
-    }
-    if (is_supported_rfbc_modifier(modifier)) {
-        *is_rfbc = 1;
         return 0;
     }
 
@@ -473,13 +511,20 @@ static int validate_drm_desc_shape(AVFilterContext *avctx,
 }
 
 static int validate_linear_drm_layer(AVFilterContext *avctx,
+                                     const AVDRMObjectDescriptor *object,
                                      const AVDRMLayerDescriptor *layer,
-                                     enum AVPixelFormat pix_fmt)
+                                     enum AVPixelFormat pix_fmt,
+                                     int width, int height)
 {
     uint32_t drm_fmt = get_drm_linear_format(pix_fmt);
+    ptrdiff_t linesizes[4] = { 0 };
+    size_t plane_sizes[4] = { 0 };
+    size_t expected_offset = 0;
     int nb_planes = av_pix_fmt_count_planes(pix_fmt);
+    int layout_height, ret;
 
-    if (drm_fmt == DRM_FORMAT_INVALID ||
+    if (!object || width <= 0 || height <= 0 ||
+        drm_fmt == DRM_FORMAT_INVALID ||
         nb_planes < 1 || nb_planes > AV_DRM_MAX_PLANES) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported DRM format for pixel format '%s'\n",
                av_get_pix_fmt_name(pix_fmt));
@@ -492,6 +537,97 @@ static int validate_linear_drm_layer(AVFilterContext *avctx,
                layer ? layer->format : 0, layer ? layer->nb_planes : 0,
                av_get_pix_fmt_name(pix_fmt));
         return AVERROR(EINVAL);
+    }
+
+    for (int i = 0; i < nb_planes; i++) {
+        const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+        int min_linesize;
+
+        if (plane->object_index < 0 || plane->offset < 0 || plane->pitch <= 0) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid DRM plane %d descriptor\n", i);
+            return AVERROR(EINVAL);
+        }
+        min_linesize = av_image_get_linesize(pix_fmt, width, i);
+        if (min_linesize < 0)
+            return min_linesize;
+        if (plane->pitch < min_linesize) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM plane %d pitch %td is smaller than required %d\n",
+                   i, plane->pitch, min_linesize);
+            return AVERROR(EINVAL);
+        }
+        linesizes[i] = plane->pitch;
+    }
+
+    if (layer->planes[0].offset != 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Only zero-based DRM plane layouts are supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    layout_height = height;
+    if (nb_planes > 1) {
+        if (layer->planes[1].offset % layer->planes[0].pitch) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM chroma plane offset is not aligned to luma pitch\n");
+            return AVERROR(EINVAL);
+        }
+        layout_height = layer->planes[1].offset / layer->planes[0].pitch;
+        if (layout_height < height) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM luma stride height %d is smaller than frame height %d\n",
+                   layout_height, height);
+            return AVERROR(EINVAL);
+        }
+    }
+
+    ret = av_image_fill_plane_sizes(plane_sizes, pix_fmt, layout_height, linesizes);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < nb_planes; i++) {
+        const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+
+        if ((size_t)plane->offset > object->size ||
+            plane_sizes[i] > object->size - (size_t)plane->offset) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM plane %d extends past object size\n", i);
+            return AVERROR(EINVAL);
+        }
+        if ((size_t)plane->offset != expected_offset) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Only zero-based contiguous DRM plane layouts are supported\n");
+            return AVERROR(ENOSYS);
+        }
+        expected_offset += plane_sizes[i];
+    }
+
+    return 0;
+}
+
+static int validate_afbc_drm_layer(AVFilterContext *avctx,
+                                   const AVDRMObjectDescriptor *object,
+                                   const AVDRMLayerDescriptor *layer,
+                                   enum AVPixelFormat pix_fmt)
+{
+    const AVDRMPlaneDescriptor *plane;
+    uint32_t drm_fbc_fmt = get_drm_afbc_format(pix_fmt);
+
+    if (!object || !layer || !object->size || layer->nb_planes != 1) {
+        av_log(avctx, AV_LOG_ERROR, "AFBC input must contain exactly one plane\n");
+        return AVERROR(EINVAL);
+    }
+
+    plane = &layer->planes[0];
+    if (plane->object_index < 0 || plane->offset != 0 || plane->pitch <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid AFBC DRM plane descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (drm_fbc_fmt == DRM_FORMAT_INVALID || drm_fbc_fmt != layer->format) {
+        av_log(avctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported\n",
+               av_get_pix_fmt_name(pix_fmt));
+        return AVERROR(ENOSYS);
     }
 
     return 0;
@@ -622,10 +758,12 @@ static int set_colorspace_info(AVFilterContext *avctx,
     else if (!rgb_in && rgb_out) {
         /* yuv full/limit -> rgb full */
         switch (in_rng) {
+        case AVCOL_RANGE_UNSPECIFIED:
         case AVCOL_RANGE_MPEG:
             if (in_spc == AVCOL_SPC_BT709)
                 out_mode = 3 << 0; /* IM_YUV_TO_RGB_BT709_LIMIT */
-            if (in_spc == AVCOL_SPC_BT470BG)
+            if (in_spc == AVCOL_SPC_BT470BG ||
+                in_spc == AVCOL_SPC_UNSPECIFIED)
                 out_mode = 1 << 0; /* IM_YUV_TO_RGB_BT601_LIMIT */
             break;
         case AVCOL_RANGE_JPEG:
@@ -638,6 +776,11 @@ static int set_colorspace_info(AVFilterContext *avctx,
                 in_spc == AVCOL_SPC_UNSPECIFIED)
                 out_mode = 2 << 0; /* IM_YUV_TO_RGB_BT601_FULL */
             break;
+        }
+        if (!out_mode) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "YUV to RGB color space/range conversion is not supported\n");
+            return AVERROR(ENOSYS);
         }
         if (out_spc)
             *out_spc = AVCOL_SPC_RGB;
@@ -737,7 +880,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     const AVDRMLayerDescriptor *layer;
     const AVDRMPlaneDescriptor *plane0;
     RGAFrame **frame_list = NULL;
-    int is_afbc = 0, is_rfbc = 0;
+    int is_afbc = 0;
     int ret, is_fbc = 0;
 
     if (pat_preproc && !nb_link)
@@ -774,12 +917,13 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         goto fail;
     }
 
-    ret = validate_drm_modifier(ctx, object->format_modifier, &is_afbc, &is_rfbc);
+    ret = validate_drm_modifier(ctx, object->format_modifier, &is_afbc);
     if (ret < 0)
         goto fail;
-    is_fbc = is_afbc || is_rfbc;
+    is_fbc = is_afbc;
     if (!is_fbc) {
-        ret = validate_linear_drm_layer(ctx, layer, in_info->pix_fmt);
+        ret = validate_linear_drm_layer(ctx, object, layer, in_info->pix_fmt,
+                                        inlink->w, inlink->h);
         if (ret < 0)
             goto fail;
 
@@ -788,7 +932,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
                                in_info->pix_fmt,
                                (in_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
                                (in_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               in_info->bytes_pp, &w_stride, &h_stride);
+                               inlink->w, inlink->h, &w_stride, &h_stride);
         if (ret < 0 || !w_stride || !h_stride) {
             av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
             goto fail;
@@ -810,12 +954,16 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 
     if (is_fbc && !r->has_rga2p &&
         (r->is_rga2_used || is_rga2_core_mask(out_info->scheduler_core))) {
-        av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC/RFBC modifier is not supported by RGA2 (non-Pro)\n",
+        av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported by RGA2 (non-Pro)\n",
                av_get_pix_fmt_name(in_info->pix_fmt));
         goto fail;
     }
 
     if (!is_fbc) {
+        ret = validate_active_rect_stride(ctx, in_info,
+                                          w_stride, h_stride, "Input");
+        if (ret < 0)
+            goto fail;
         ret = validate_rga3_pixel_stride(ctx, in_info, out_info,
                                          w_stride, h_stride, "Input");
         if (ret < 0)
@@ -837,37 +985,34 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 
     if (is_fbc) {
         int afbc_offset_y = 0;
-        int fbc_align_w =
-            is_afbc ? RK_RGA_AFBC_16x16_STRIDE_ALIGN : RK_RGA_RFBC_64x4_STRIDE_ALIGN_W;
-        int fbc_align_h =
-            is_afbc ? RK_RGA_AFBC_16x16_STRIDE_ALIGN : RK_RGA_RFBC_64x4_STRIDE_ALIGN_H;
-        uint32_t drm_fbc_fmt =
-            is_afbc ? get_drm_afbc_format(in_info->pix_fmt) : get_drm_rfbc_format(in_info->pix_fmt);
+
+        ret = validate_afbc_drm_layer(ctx, object, layer, in_info->pix_fmt);
+        if (ret < 0)
+            goto fail;
 
         if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
-            afbc_offset_y = is_afbc ? rkmpp_desc->afbc_offset_y : 0;
+            afbc_offset_y = rkmpp_desc->afbc_offset_y;
             info.rect.yoffset += afbc_offset_y;
         }
 
         plane0 = &layer->planes[0];
-        if (drm_fbc_fmt == layer->format) {
-            info.rect.wstride = plane0->pitch;
-            if ((ret = get_afbc_pixel_stride(in_info->bytes_pp, &info.rect.wstride, 1)) < 0)
-                goto fail;
-
-            if (info.rect.wstride % fbc_align_w)
-                info.rect.wstride = FFALIGN(inlink->w, fbc_align_w);
-
-            info.rect.hstride = FFALIGN(inlink->h + afbc_offset_y, fbc_align_h);
-        } else {
-            av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC/RFBC modifier is not supported\n",
-                   av_get_pix_fmt_name(in_info->pix_fmt));
+        info.rect.wstride = plane0->pitch;
+        if ((ret = get_afbc_pixel_stride(in_info->bytes_pp, &info.rect.wstride, 1)) < 0)
             goto fail;
-        }
 
-        info.rd_mode =
-            is_afbc ? (1 << 1)  /* IM_AFBC16x16_MODE */
-                    : (1 << 4); /* IM_RKFBC64x4_MODE */
+        if (info.rect.wstride % RK_RGA_AFBC_16x16_STRIDE_ALIGN)
+            info.rect.wstride = FFALIGN(inlink->w, RK_RGA_AFBC_16x16_STRIDE_ALIGN);
+
+        info.rect.hstride = FFALIGN(inlink->h + afbc_offset_y,
+                                    RK_RGA_AFBC_16x16_STRIDE_ALIGN);
+
+        ret = validate_active_rect_stride(ctx, in_info,
+                                          info.rect.wstride,
+                                          info.rect.hstride, "Input");
+        if (ret < 0)
+            goto fail;
+
+        info.rd_mode = 1 << 1; /* IM_AFBC16x16_MODE */
     }
 
     rga_frame->info = info;
@@ -977,7 +1122,8 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     }
 
     is_afbc = r->afbc_out && !pat_preproc;
-    ret = validate_linear_drm_layer(ctx, layer, out_info->pix_fmt);
+    ret = validate_linear_drm_layer(ctx, object, layer, out_info->pix_fmt,
+                                    outlink->w, outlink->h);
     if (ret < 0)
         goto fail;
     ret = get_pixel_stride(object,
@@ -985,13 +1131,17 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                            out_info->pix_fmt,
                            (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
                            (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                           out_info->bytes_pp, &w_stride, &h_stride);
+                           outlink->w, outlink->h, &w_stride, &h_stride);
     if (!is_afbc && (ret < 0 || !w_stride || !h_stride)) {
         av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
         goto fail;
     }
 
     if (!is_afbc) {
+        ret = validate_active_rect_stride(ctx, out_info,
+                                          w_stride, h_stride, "Output");
+        if (ret < 0)
+            goto fail;
         ret = validate_rga3_pixel_stride(ctx, out_info, &r->out_rga_frame_info,
                                          w_stride, h_stride, "Output");
         if (ret < 0)
@@ -1376,7 +1526,9 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         if (src->act_w < 68 ||
             src->act_w > 8176 ||
             src->act_h > 8176 ||
-            dst->act_w < 68) {
+            dst->act_w < 68 ||
+            dst->act_w > 8128 ||
+            dst->act_h > 8128) {
             r->is_rga2_used = 1;
         }
         if (pat && (pat->act_w < 68 ||

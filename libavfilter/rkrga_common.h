@@ -36,8 +36,6 @@
 
 #define RK_RGA_YUV_ALIGN                2
 #define RK_RGA_AFBC_16x16_STRIDE_ALIGN  16
-#define RK_RGA_RFBC_64x4_STRIDE_ALIGN_W 64
-#define RK_RGA_RFBC_64x4_STRIDE_ALIGN_H 4
 
 #define ALIGN_DOWN(a, b) ((a) & ~((b)-1))
 #define FF_INLINK_IDX(link)  ((int)((link)->dstpad - (link)->dst->input_pads))

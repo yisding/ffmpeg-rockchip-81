@@ -501,7 +501,7 @@ static void mmap_release_buffer(void *opaque, uint8_t *data)
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = buf_descriptor->index;
     buf.m.planes = s->multiplanar ? planes : NULL;
-    buf.length   = s->multiplanar ? VIDEO_MAX_PLANES : 0;
+    buf.length   = s->multiplanar ? s->plane_count : 0;
     av_free(buf_descriptor);
 
     enqueue_buffer(s, &buf);
@@ -576,7 +576,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         .type   = s->buf_type,
         .memory = V4L2_MEMORY_MMAP,
         .m.planes = s->multiplanar ? planes : NULL,
-        .length   = s->multiplanar ? VIDEO_MAX_PLANES : 0,
+        .length   = s->multiplanar ? s->plane_count : 0,
     };
     struct timeval buf_ts;
     unsigned int plane_payload[VIDEO_MAX_PLANES] = { 0 };
@@ -606,6 +606,13 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     atomic_fetch_add(&s->buffers_queued, -1);
     // always keep at least one buffer queued
     av_assert0(atomic_load(&s->buffers_queued) >= 1);
+    if (s->multiplanar && buf.length != s->plane_count) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Dequeued v4l2 buffer has %u planes; expected %d.\n",
+               buf.length, s->plane_count);
+        res = enqueue_buffer(s, &buf);
+        return res ? res : AVERROR(EINVAL);
+    }
 
     if (s->multiplanar) {
         for (int plane = 0; plane < buf.length; plane++) {
@@ -743,7 +750,7 @@ static int mmap_start(AVFormatContext *ctx)
             .index  = i,
             .memory = V4L2_MEMORY_MMAP,
             .m.planes = s->multiplanar ? planes : NULL,
-            .length   = s->multiplanar ? VIDEO_MAX_PLANES : 0,
+            .length   = s->multiplanar ? s->plane_count : 0,
         };
 
         if (v4l2_ioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
