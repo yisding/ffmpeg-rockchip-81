@@ -346,6 +346,21 @@ static MPPEncFrame *get_free_frame(MPPEncFrame **list)
     return out;
 }
 
+static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
+{
+    if (!frame || !frame->data[0])
+        return NULL;
+
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
+        if (frame->buf[i] &&
+            frame->buf[i]->data == frame->data[0] &&
+            frame->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor))
+            return (const AVRKMPPDRMFrameDescriptor *)frame->data[0];
+    }
+
+    return NULL;
+}
+
 static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
 {
     RKMPPEncContext *r = avctx->priv_data;
@@ -367,7 +382,7 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
     if (ret < 0)
         return ret;
     if (drm_desc->objects[0].fd < 0)
-        return AVERROR(ENOMEM);
+        return AVERROR(EINVAL);
 
     pix_desc = av_pix_fmt_desc_get(r->pix_fmt);
     is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
@@ -790,6 +805,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     MppBuffer mpp_buf = NULL;
     AVFrame *drm_frame = NULL;
     const AVDRMFrameDescriptor *drm_desc;
+    const AVRKMPPDRMFrameDescriptor *rkmpp_desc = NULL;
     const AVDRMLayerDescriptor *layer;
     const AVDRMPlaneDescriptor *plane0;
     const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(r->pix_fmt);
@@ -861,6 +877,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     drm_desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
+    rkmpp_desc = get_rkmpp_drm_desc(drm_frame);
     ret = rkmpp_check_drm_object0(avctx, drm_desc);
     if (ret < 0) {
         *errp = ret;
@@ -936,8 +953,8 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
         }
         mpp_fmt |= MPP_FRAME_FBC_AFBC_V2;
 
-        if (drm_frame->crop_top > 0) {
-            afbc_offset_y = drm_frame->crop_top;
+        if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
+            afbc_offset_y = rkmpp_desc->afbc_offset_y;
             mpp_frame_set_offset_y(mpp_frame, afbc_offset_y);
         }
     }
@@ -1404,6 +1421,12 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
 
         pkt_pos = mpp_packet_get_pos(mpp_pkt);
         pkt_len = mpp_packet_get_length(mpp_pkt);
+        if (!pkt_pos || pkt_len == 0 || pkt_len > sizeof(enc_hdr_buf)) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid header packet from MPP: ptr=%p len=%zu\n",
+                   pkt_pos, pkt_len);
+            ret = AVERROR_EXTERNAL;
+            goto fail;
+        }
 
         if (avctx->extradata) {
             av_free(avctx->extradata);
