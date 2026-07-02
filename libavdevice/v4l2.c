@@ -864,8 +864,14 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
             const int total_height = timings.bt.height + timings.bt.vfrontporch + timings.bt.vsync + timings.bt.vbackporch;
             total_pixels = (int64_t)total_width * total_height;
         }
+        if (framerate_q.num && framerate_q.den) {
+            // a user-specified framerate always wins over the estimate below
+            tpf->numerator   = framerate_q.den;
+            tpf->denominator = framerate_q.num;
+            av_log(ctx, AV_LOG_WARNING, "ioctl(VIDIOC_G_PARM): %s, using framerate %d/%d\n",
+                av_err2str(ret), framerate_q.num, framerate_q.den);
         // no-signal or bogus timings may report zero dimensions/pixelclock
-        if (total_pixels > 0 && timings.bt.pixelclock > 0) {
+        } else if (total_pixels > 0 && timings.bt.pixelclock > 0) {
             int64_t framerate_den = 1001;
             int64_t framerate_num = av_rescale(timings.bt.pixelclock, framerate_den, total_pixels);
             framerate_num = ((framerate_num + 5) / 10) * 10; // round by 10
@@ -883,12 +889,6 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
             }
             av_log(ctx, AV_LOG_WARNING, "ioctl(VIDIOC_G_PARM): %s, estimated framerate %d/%d from dv timings.\n",
                 av_err2str(ret), tpf->denominator, tpf->numerator);
-        } else if (framerate_q.num && framerate_q.den) {
-            // use user defined framerate for further error cases.
-            tpf->numerator   = framerate_q.den;
-            tpf->denominator = framerate_q.num;
-            av_log(ctx, AV_LOG_WARNING, "ioctl(VIDIOC_G_PARM): %s, using framerate %d/%d\n",
-                av_err2str(ret), framerate_q.num, framerate_q.den);
         } else {
             av_log(ctx, AV_LOG_WARNING, "ioctl(VIDIOC_G_PARM): %s\n", av_err2str(ret));
         }
@@ -1017,14 +1017,13 @@ static int v4l2_read_header(AVFormatContext *ctx)
         return s->fd;
 
     if (s->channel != -1) {
-        /* set video input */
+        /* set video input: capturing from the wrong input is never
+         * acceptable when one was explicitly requested */
         av_log(ctx, AV_LOG_DEBUG, "Selecting input_channel: %d\n", s->channel);
         if (v4l2_ioctl(s->fd, VIDIOC_S_INPUT, &s->channel) < 0) {
             res = AVERROR(errno);
-            av_log(ctx, (s->ignore_input_error) ? AV_LOG_WARNING : AV_LOG_ERROR, "ioctl(VIDIOC_S_INPUT): %s\n", av_err2str(res));
-            if (!s->ignore_input_error) {
-                goto fail;
-            }
+            av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_S_INPUT): %s\n", av_err2str(res));
+            goto fail;
         }
     } else {
         /* get current video input */
@@ -1269,7 +1268,7 @@ static const AVOption options[] = {
     { "pixel_format", "set preferred pixel format",                               OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
-    { "ignore_input_error", "ignore input error",                                 OFFSET(ignore_input_error), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1,      DEC },
+    { "ignore_input_error", "ignore the input probe (VIDIOC_G_INPUT) error and assume input 0", OFFSET(ignore_input_error), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1,      DEC },
 
     { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, .unit = "list_formats" },
     { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, .unit = "list_formats" },

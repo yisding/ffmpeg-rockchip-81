@@ -657,7 +657,9 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         info.is_10b_compact = info.is_10b_endian = 1;
 
     if (!pat_preproc) {
-        int is_rga2_used = r->is_rga2_used || out_info->scheduler_core == (out_info->scheduler_core & 0xc);
+        int is_rga2_used = r->is_rga2_used ||
+                           (out_info->scheduler_core > 0 &&
+                            out_info->scheduler_core == (out_info->scheduler_core & 0xc));
 
 #ifdef RGA_NORMAL_DST_FULL_CSC_FIXUP
         if (in1_info && picref_pat) {
@@ -1206,8 +1208,11 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
             (param->overlay_y >= 0) &&
             (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
             (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2);
-        if (r->is_overlay_offset_valid)
-            init_pat_preproc_hwframes_ctx(avctx);
+        if (r->is_overlay_offset_valid) {
+            ret = init_pat_preproc_hwframes_ctx(avctx);
+            if (ret < 0)
+                goto fail;
+        }
     }
 
     /* OUT RGAFrameInfo */
