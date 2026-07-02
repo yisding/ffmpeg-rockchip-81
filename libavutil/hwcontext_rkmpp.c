@@ -37,6 +37,7 @@
 #include "hwcontext_internal.h"
 #include "imgutils.h"
 #include "mem.h"
+#include "pixdesc.h"
 
 static const struct {
     enum AVPixelFormat pixfmt;
@@ -94,6 +95,15 @@ static const struct {
     { AV_PIX_FMT_X2BGR10LE, DRM_FORMAT_XBGR2101010, },
     { AV_PIX_FMT_X2BGR10BE, DRM_FORMAT_XBGR2101010 | DRM_FORMAT_BIG_ENDIAN, },
 };
+
+static uint32_t rkmpp_get_drm_format(enum AVPixelFormat pix_fmt)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++)
+        if (supported_formats[i].pixfmt == pix_fmt)
+            return supported_formats[i].drm_format;
+
+    return DRM_FORMAT_INVALID;
+}
 
 static int rkmpp_device_create(AVHWDeviceContext *hwdev, const char *device,
                                AVDictionary *opts, int flags)
@@ -394,6 +404,84 @@ static void rkmpp_unmap_frame(AVHWFramesContext *hwfc,
     av_free(map);
 }
 
+static int rkmpp_validate_drm_descriptor(AVHWFramesContext *hwfc,
+                                         const AVRKMPPDRMFrameDescriptor *desc)
+{
+    const AVDRMFrameDescriptor *drm_desc;
+    const AVDRMLayerDescriptor *layer;
+    ptrdiff_t linesizes[4] = { 0 };
+    size_t plane_sizes[4] = { 0 };
+    uint32_t drm_format = rkmpp_get_drm_format(hwfc->sw_format);
+    int nb_planes, ret;
+
+    if (!desc) {
+        av_log(hwfc, AV_LOG_ERROR, "Missing RKMPP DRM frame descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    drm_desc = &desc->drm_desc;
+    if (drm_desc->nb_objects < 1 ||
+        drm_desc->nb_objects > AV_DRM_MAX_PLANES ||
+        drm_desc->nb_layers != 1) {
+        av_log(hwfc, AV_LOG_ERROR, "Invalid RKMPP DRM frame descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    for (int i = 0; i < drm_desc->nb_objects; i++) {
+        const AVDRMObjectDescriptor *object = &drm_desc->objects[i];
+
+        if (object->fd < 0 || object->size == 0) {
+            av_log(hwfc, AV_LOG_ERROR, "Invalid RKMPP DRM object %d\n", i);
+            return AVERROR(EINVAL);
+        }
+        if (object->format_modifier != DRM_FORMAT_MOD_LINEAR) {
+            av_log(hwfc, AV_LOG_ERROR, "Transfer non-linear DRM_PRIME frame is not supported!\n");
+            return AVERROR(ENOSYS);
+        }
+    }
+
+    layer = &drm_desc->layers[0];
+    nb_planes = av_pix_fmt_count_planes(hwfc->sw_format);
+    if (drm_format == DRM_FORMAT_INVALID ||
+        nb_planes < 1 || nb_planes > AV_DRM_MAX_PLANES ||
+        layer->format != drm_format ||
+        layer->nb_planes != nb_planes) {
+        av_log(hwfc, AV_LOG_ERROR, "Invalid RKMPP DRM layer descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    for (int i = 0; i < nb_planes; i++) {
+        const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+        int object_index = plane->object_index;
+
+        if (object_index < 0 || object_index >= drm_desc->nb_objects ||
+            plane->offset < 0 || plane->pitch <= 0) {
+            av_log(hwfc, AV_LOG_ERROR, "Invalid RKMPP DRM plane %d descriptor\n", i);
+            return AVERROR(EINVAL);
+        }
+        linesizes[i] = plane->pitch;
+    }
+
+    ret = av_image_fill_plane_sizes(plane_sizes, hwfc->sw_format,
+                                    hwfc->height, linesizes);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < nb_planes; i++) {
+        const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+        const AVDRMObjectDescriptor *object = &drm_desc->objects[plane->object_index];
+
+        if ((size_t)plane->offset > object->size ||
+            plane_sizes[i] > object->size - (size_t)plane->offset) {
+            av_log(hwfc, AV_LOG_ERROR,
+                   "RKMPP DRM plane %d extends past object size\n", i);
+            return AVERROR(EINVAL);
+        }
+    }
+
+    return 0;
+}
+
 static int rkmpp_map_frame(AVHWFramesContext *hwfc,
                            AVFrame *dst, const AVFrame *src, int flags)
 {
@@ -405,6 +493,10 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     int err, i, p, plane;
     int mmap_prot;
     void *addr;
+
+    err = rkmpp_validate_drm_descriptor(hwfc, desc);
+    if (err < 0)
+        return err;
 
     map = av_mallocz(sizeof(*map));
     if (!map)
@@ -425,13 +517,6 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     sync_start.flags = DMA_BUF_SYNC_START | map->sync_flags;
 #endif
 
-    if (desc->drm_desc.objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(hwfc, AV_LOG_ERROR, "Transfer non-linear DRM_PRIME frame is not supported!\n");
-        av_free(map);
-        return AVERROR(ENOSYS);
-    }
-
-    av_assert0(desc->drm_desc.nb_objects <= AV_DRM_MAX_PLANES);
     for (i = 0; i < desc->drm_desc.nb_objects; i++) {
         addr = NULL;
         if (desc->buffers[i])
@@ -475,7 +560,6 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
             ++plane;
         }
     }
-    av_assert0(plane <= AV_DRM_MAX_PLANES);
 
     dst->width  = src->width;
     dst->height = src->height;

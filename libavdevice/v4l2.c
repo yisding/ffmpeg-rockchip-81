@@ -854,16 +854,23 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
 
     streamparm.type = s->buf_type;
     if (v4l2_ioctl(s->fd, VIDIOC_G_PARM, &streamparm) < 0) {
-        // for error cases, try to get frame rate from VIDIOC_G_DV_TIMINGS
-        struct v4l2_dv_timings timings = { 0 };
         int64_t total_pixels = 0;
+        int64_t pixelclock = 0;
         ret = AVERROR(errno);
-        if (v4l2_ioctl(s->fd, VIDIOC_G_DV_TIMINGS, &timings) == 0 &&
-            timings.type == V4L2_DV_BT_656_1120) {
-            const int total_width  = timings.bt.width  + timings.bt.hfrontporch + timings.bt.hsync + timings.bt.hbackporch;
-            const int total_height = timings.bt.height + timings.bt.vfrontporch + timings.bt.vsync + timings.bt.vbackporch;
-            total_pixels = (int64_t)total_width * total_height;
+#if defined(VIDIOC_G_DV_TIMINGS) && defined(V4L2_DV_BT_656_1120)
+        // for error cases, try to get frame rate from VIDIOC_G_DV_TIMINGS
+        {
+            struct v4l2_dv_timings timings = { 0 };
+
+            if (v4l2_ioctl(s->fd, VIDIOC_G_DV_TIMINGS, &timings) == 0 &&
+                timings.type == V4L2_DV_BT_656_1120) {
+                const int total_width  = timings.bt.width  + timings.bt.hfrontporch + timings.bt.hsync + timings.bt.hbackporch;
+                const int total_height = timings.bt.height + timings.bt.vfrontporch + timings.bt.vsync + timings.bt.vbackporch;
+                total_pixels = (int64_t)total_width * total_height;
+                pixelclock = timings.bt.pixelclock;
+            }
         }
+#endif
         if (framerate_q.num && framerate_q.den) {
             // a user-specified framerate always wins over the estimate below
             tpf->numerator   = framerate_q.den;
@@ -871,9 +878,9 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
             av_log(ctx, AV_LOG_WARNING, "ioctl(VIDIOC_G_PARM): %s, using framerate %d/%d\n",
                 av_err2str(ret), framerate_q.num, framerate_q.den);
         // no-signal or bogus timings may report zero dimensions/pixelclock
-        } else if (total_pixels > 0 && timings.bt.pixelclock > 0) {
+        } else if (total_pixels > 0 && pixelclock > 0) {
             int64_t framerate_den = 1001;
-            int64_t framerate_num = av_rescale(timings.bt.pixelclock, framerate_den, total_pixels);
+            int64_t framerate_num = av_rescale(pixelclock, framerate_den, total_pixels);
             framerate_num = ((framerate_num + 5) / 10) * 10; // round by 10
             if (framerate_num % 1000 == 0) {
                 tpf->numerator   = framerate_den;
@@ -881,7 +888,7 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
             } else {
                 int framerate_num_dst = 0, framerate_den_dst = 0;
                 framerate_den = 1000;
-                framerate_num = av_rescale(timings.bt.pixelclock, framerate_den, total_pixels);
+                framerate_num = av_rescale(pixelclock, framerate_den, total_pixels);
                 framerate_num = ((framerate_num + 5) / 10) * 10; // round by 10
                 av_reduce(&framerate_num_dst, &framerate_den_dst, framerate_num, framerate_den, INT_MAX);
                 tpf->numerator   = framerate_den_dst;
