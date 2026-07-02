@@ -104,6 +104,7 @@ struct video_data {
     int has_capture_mplane;
 
     int buffers;
+    int mmap_buffers_requested;
     int plane_count;
     int raw_plane_count;
     size_t raw_plane_size[VIDEO_MAX_PLANES];
@@ -430,6 +431,21 @@ static void mmap_free(struct video_data *s, int n)
     atomic_store(&s->buffers_queued, 0);
 }
 
+static void mmap_release_kernel_buffers(struct video_data *s)
+{
+    struct v4l2_requestbuffers req = {
+        .type   = s->buf_type,
+        .count  = 0,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+
+    if (!s->mmap_buffers_requested)
+        return;
+
+    v4l2_ioctl(s->fd, VIDIOC_REQBUFS, &req);
+    s->mmap_buffers_requested = 0;
+}
+
 static int mmap_init(AVFormatContext *ctx)
 {
     int i, res;
@@ -445,6 +461,8 @@ static int mmap_init(AVFormatContext *ctx)
         av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_REQBUFS): %s\n", av_err2str(res));
         return res;
     }
+
+    s->mmap_buffers_requested = req.count > 0;
 
     if (req.count < 2) {
         av_log(ctx, AV_LOG_ERROR, "Insufficient buffer memory\n");
@@ -880,6 +898,7 @@ static void mmap_close(struct video_data *s)
      */
     v4l2_ioctl(s->fd, VIDIOC_STREAMOFF, &type);
     mmap_free(s, s->buffers);
+    mmap_release_kernel_buffers(s);
 }
 
 static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
