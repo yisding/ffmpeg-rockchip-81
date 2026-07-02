@@ -301,13 +301,15 @@ static int rkmpp_check_drm_layer_format(AVCodecContext *avctx,
 static int rkmpp_check_linear_drm_layout(AVCodecContext *avctx,
                                          const AVDRMFrameDescriptor *desc,
                                          enum AVPixelFormat pix_fmt,
+                                         int width,
                                          int height)
 {
     const AVDRMObjectDescriptor *object;
     const AVDRMLayerDescriptor *layer;
     ptrdiff_t linesizes[4] = { 0 };
     size_t plane_sizes[4] = { 0 };
-    int nb_planes, ret;
+    size_t expected_offset = 0;
+    int nb_planes, layout_height, ret;
 
     if (!desc || desc->nb_objects != 1 || desc->nb_layers != 1) {
         av_log(avctx, AV_LOG_ERROR, "DRM input must contain exactly one object and one layer\n");
@@ -331,6 +333,7 @@ static int rkmpp_check_linear_drm_layout(AVCodecContext *avctx,
 
     for (int i = 0; i < nb_planes; i++) {
         const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+        int min_linesize;
 
         if (plane->object_index != 0 ||
             plane->offset < 0 ||
@@ -338,10 +341,41 @@ static int rkmpp_check_linear_drm_layout(AVCodecContext *avctx,
             av_log(avctx, AV_LOG_ERROR, "Invalid DRM plane %d descriptor\n", i);
             return AVERROR(EINVAL);
         }
+        min_linesize = av_image_get_linesize(pix_fmt, width, i);
+        if (min_linesize < 0)
+            return min_linesize;
+        if (plane->pitch < min_linesize) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM plane %d pitch %td is smaller than required %d\n",
+                   i, plane->pitch, min_linesize);
+            return AVERROR(EINVAL);
+        }
         linesizes[i] = plane->pitch;
     }
 
-    ret = av_image_fill_plane_sizes(plane_sizes, pix_fmt, height, linesizes);
+    if (layer->planes[0].offset != 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Only zero-based DRM plane layouts are supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    layout_height = height;
+    if (nb_planes > 1) {
+        if (layer->planes[1].offset % layer->planes[0].pitch) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM chroma plane offset is not aligned to luma pitch\n");
+            return AVERROR(EINVAL);
+        }
+        layout_height = layer->planes[1].offset / layer->planes[0].pitch;
+        if (layout_height < height) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM luma stride height %d is smaller than frame height %d\n",
+                   layout_height, height);
+            return AVERROR(EINVAL);
+        }
+    }
+
+    ret = av_image_fill_plane_sizes(plane_sizes, pix_fmt, layout_height, linesizes);
     if (ret < 0)
         return ret;
 
@@ -354,6 +388,47 @@ static int rkmpp_check_linear_drm_layout(AVCodecContext *avctx,
                    "DRM plane %d extends past object size\n", i);
             return AVERROR(EINVAL);
         }
+        if ((size_t)plane->offset != expected_offset) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Only zero-based contiguous DRM plane layouts are supported\n");
+            return AVERROR(ENOSYS);
+        }
+        expected_offset += plane_sizes[i];
+    }
+
+    return 0;
+}
+
+static int rkmpp_check_afbc_drm_layout(AVCodecContext *avctx,
+                                       const AVDRMFrameDescriptor *desc,
+                                       enum AVPixelFormat pix_fmt,
+                                       MppFrameFormat mpp_fmt)
+{
+    const AVDRMLayerDescriptor *layer;
+    const AVDRMPlaneDescriptor *plane;
+    uint32_t drm_fbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
+
+    if (!desc || desc->nb_objects != 1 || desc->nb_layers != 1) {
+        av_log(avctx, AV_LOG_ERROR, "DRM input must contain exactly one object and one layer\n");
+        return AVERROR(EINVAL);
+    }
+
+    layer = &desc->layers[0];
+    if (!desc->objects[0].size || layer->nb_planes != 1) {
+        av_log(avctx, AV_LOG_ERROR, "AFBC input must contain exactly one plane\n");
+        return AVERROR(EINVAL);
+    }
+
+    plane = &layer->planes[0];
+    if (plane->object_index != 0 || plane->offset != 0 || plane->pitch <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid AFBC DRM plane descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (drm_fbc_fmt == DRM_FORMAT_INVALID || drm_fbc_fmt != layer->format) {
+        av_log(avctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported\n",
+               av_get_pix_fmt_name(pix_fmt));
+        return AVERROR(ENOSYS);
     }
 
     return 0;
@@ -489,7 +564,7 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
     RKMPPEncContext *r = avctx->priv_data;
     MppEncCfg cfg = r->mcfg;
     MppFrameFormat mpp_fmt = r->mpp_fmt;
-    int ret, is_afbc = 0, is_rfbc = 0, is_fbc = 0;
+    int ret, is_afbc = 0, is_fbc = 0;
     int hor_stride = 0, ver_stride = 0;
     const AVPixFmtDescriptor *pix_desc;
     const AVDRMFrameDescriptor *drm_desc;
@@ -509,11 +584,10 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
 
     pix_desc = av_pix_fmt_desc_get(r->pix_fmt);
     is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
-    is_rfbc = drm_is_rfbc(drm_desc->objects[0].format_modifier);
-    is_fbc  = is_afbc || is_rfbc;
+    is_fbc  = is_afbc;
     if (!is_fbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(avctx, AV_LOG_ERROR, "Only linear, AFBC and RFBC modifiers are supported\n");
+        av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
         return AVERROR(ENOSYS);
     }
     if (is_fbc &&
@@ -524,7 +598,8 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR(ENOSYS);
     }
     if (!is_fbc) {
-        ret = rkmpp_check_linear_drm_layout(avctx, drm_desc, r->pix_fmt, avctx->height);
+        ret = rkmpp_check_linear_drm_layout(avctx, drm_desc, r->pix_fmt,
+                                            avctx->width, avctx->height);
         if (ret < 0)
             return ret;
 
@@ -567,15 +642,10 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
     }
 
     if (is_fbc) {
-        const AVDRMLayerDescriptor *layer = &drm_desc->layers[0];
-        uint32_t drm_fbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
-
-        if (drm_fbc_fmt != layer->format) {
-            av_log(avctx, AV_LOG_ERROR, "Input format '%s' with FBC modifier is not supported\n",
-                   av_get_pix_fmt_name(r->pix_fmt));
-            return AVERROR(ENOSYS);
-        }
-        mpp_fmt |= is_rfbc ? MPP_FRAME_FBC_RKFBC : MPP_FRAME_FBC_AFBC_V2;
+        ret = rkmpp_check_afbc_drm_layout(avctx, drm_desc, r->pix_fmt, mpp_fmt);
+        if (ret < 0)
+            return ret;
+        mpp_fmt |= MPP_FRAME_FBC_AFBC_V2;
     }
     mpp_enc_cfg_set_s32(cfg, "prep:format", mpp_fmt);
 
@@ -944,7 +1014,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     int hor_stride = 0, ver_stride = 0;
     MppBufferInfo buf_info = { 0 };
     MppFrameFormat mpp_fmt = r->mpp_fmt;
-    int ret, is_afbc = 0, is_rfbc = 0, is_fbc = 0;
+    int ret, is_afbc = 0, is_fbc = 0;
 
     MPPEncFrame *mpp_enc_frame = NULL;
 
@@ -1056,11 +1126,10 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     plane0 = &layer->planes[0];
 
     is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
-    is_rfbc = drm_is_rfbc(drm_desc->objects[0].format_modifier);
-    is_fbc  = is_afbc || is_rfbc;
+    is_fbc  = is_afbc;
     if (!is_fbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(avctx, AV_LOG_ERROR, "Only linear, AFBC and RFBC modifiers are supported\n");
+        av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
         *errp = AVERROR(EINVAL);
         goto exit;
     }
@@ -1073,23 +1142,22 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
         goto exit;
     }
     if (is_fbc) {
-        uint32_t drm_fbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
         int afbc_offset_y = 0;
 
-        if (drm_fbc_fmt != layer->format) {
-            av_log(avctx, AV_LOG_ERROR, "Input format '%s' with FBC modifier is not supported\n",
-                   av_get_pix_fmt_name(r->pix_fmt));
-            *errp = AVERROR(EINVAL);
+        ret = rkmpp_check_afbc_drm_layout(avctx, drm_desc, r->pix_fmt, mpp_fmt);
+        if (ret < 0) {
+            *errp = ret;
             goto exit;
         }
-        mpp_fmt |= is_rfbc ? MPP_FRAME_FBC_RKFBC : MPP_FRAME_FBC_AFBC_V2;
+        mpp_fmt |= MPP_FRAME_FBC_AFBC_V2;
 
-        if (!is_rfbc && rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
+        if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
             afbc_offset_y = rkmpp_desc->afbc_offset_y;
             mpp_frame_set_offset_y(mpp_frame, afbc_offset_y);
         }
     } else {
-        ret = rkmpp_check_linear_drm_layout(avctx, drm_desc, r->pix_fmt, drm_frame->height);
+        ret = rkmpp_check_linear_drm_layout(avctx, drm_desc, r->pix_fmt,
+                                            drm_frame->width, drm_frame->height);
         if (ret < 0) {
             *errp = ret;
             goto exit;
