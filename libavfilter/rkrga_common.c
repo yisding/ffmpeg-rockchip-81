@@ -173,7 +173,9 @@ static int get_single_drm_object_index(const AVDRMFrameDescriptor *desc,
 {
     int object_index;
 
-    if (!desc || !layer || layer->nb_planes < 1)
+    if (!desc ||
+        desc->nb_objects < 1 || desc->nb_objects > AV_DRM_MAX_PLANES ||
+        !layer || layer->nb_planes < 1 || layer->nb_planes > AV_DRM_MAX_PLANES)
         return AVERROR(EINVAL);
 
     object_index = layer->planes[0].object_index;
@@ -234,6 +236,44 @@ static uint32_t get_drm_rfbc_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_NV16:     return DRM_FORMAT_YUYV;
     case AV_PIX_FMT_NV20_PACKED: return DRM_FORMAT_Y210;
     case AV_PIX_FMT_NV24:     return DRM_FORMAT_VUY888;
+    default:                  return DRM_FORMAT_INVALID;
+    }
+}
+
+static uint32_t get_drm_linear_format(enum AVPixelFormat pix_fmt)
+{
+    switch (pix_fmt) {
+    case AV_PIX_FMT_GRAY8:    return DRM_FORMAT_R8;
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P: return DRM_FORMAT_YUV420;
+    case AV_PIX_FMT_YUV422P:
+    case AV_PIX_FMT_YUVJ422P: return DRM_FORMAT_YUV422;
+    case AV_PIX_FMT_NV12:     return DRM_FORMAT_NV12;
+    case AV_PIX_FMT_NV21:     return DRM_FORMAT_NV21;
+    case AV_PIX_FMT_NV16:     return DRM_FORMAT_NV16;
+    case AV_PIX_FMT_NV24:     return DRM_FORMAT_NV24;
+    case AV_PIX_FMT_NV42:     return DRM_FORMAT_NV42;
+    case AV_PIX_FMT_P010:     return DRM_FORMAT_P010;
+    case AV_PIX_FMT_P210:     return DRM_FORMAT_P210;
+    case AV_PIX_FMT_NV15:     return DRM_FORMAT_NV15;
+    case AV_PIX_FMT_NV20_PACKED: return DRM_FORMAT_NV20;
+    case AV_PIX_FMT_YUYV422:  return DRM_FORMAT_YUYV;
+    case AV_PIX_FMT_YVYU422:  return DRM_FORMAT_YVYU;
+    case AV_PIX_FMT_UYVY422:  return DRM_FORMAT_UYVY;
+    case AV_PIX_FMT_RGB555LE: return DRM_FORMAT_XRGB1555;
+    case AV_PIX_FMT_BGR555LE: return DRM_FORMAT_XBGR1555;
+    case AV_PIX_FMT_RGB565LE: return DRM_FORMAT_RGB565;
+    case AV_PIX_FMT_BGR565LE: return DRM_FORMAT_BGR565;
+    case AV_PIX_FMT_RGB24:    return DRM_FORMAT_RGB888;
+    case AV_PIX_FMT_BGR24:    return DRM_FORMAT_BGR888;
+    case AV_PIX_FMT_RGBA:     return DRM_FORMAT_ABGR8888;
+    case AV_PIX_FMT_RGB0:     return DRM_FORMAT_XBGR8888;
+    case AV_PIX_FMT_BGRA:     return DRM_FORMAT_ARGB8888;
+    case AV_PIX_FMT_BGR0:     return DRM_FORMAT_XRGB8888;
+    case AV_PIX_FMT_ARGB:     return DRM_FORMAT_BGRA8888;
+    case AV_PIX_FMT_0RGB:     return DRM_FORMAT_BGRX8888;
+    case AV_PIX_FMT_ABGR:     return DRM_FORMAT_RGBA8888;
+    case AV_PIX_FMT_0BGR:     return DRM_FORMAT_RGBX8888;
     default:                  return DRM_FORMAT_INVALID;
     }
 }
@@ -323,6 +363,39 @@ static int is_yuv_rect_aligned(const RGAFrameInfo *info, int x, int y, int w, in
            !((x | y | w | h) & (RK_RGA_YUV_ALIGN - 1));
 }
 
+static int is_rga2_only_input_format(enum AVPixelFormat pix_fmt)
+{
+    switch (pix_fmt) {
+    case AV_PIX_FMT_GRAY8:
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUV422P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_RGB555LE:
+    case AV_PIX_FMT_BGR555LE:
+    case AV_PIX_FMT_NV15:
+    case AV_PIX_FMT_NV20_PACKED:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int is_rga3_only_input_format(enum AVPixelFormat pix_fmt)
+{
+    switch (pix_fmt) {
+    case AV_PIX_FMT_P010:
+    case AV_PIX_FMT_P210:
+    case AV_PIX_FMT_ARGB:
+    case AV_PIX_FMT_0RGB:
+    case AV_PIX_FMT_ABGR:
+    case AV_PIX_FMT_0BGR:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int is_supported_afbc_modifier(uint64_t modifier)
 {
     return modifier == DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE |
@@ -353,6 +426,75 @@ static int validate_drm_modifier(AVFilterContext *avctx, uint64_t modifier,
     av_log(avctx, AV_LOG_ERROR, "Unsupported DRM modifier 0x%016"PRIx64"\n",
            modifier);
     return AVERROR(ENOSYS);
+}
+
+static int validate_drm_desc_shape(AVFilterContext *avctx,
+                                   const AVDRMFrameDescriptor *desc)
+{
+    if (!desc ||
+        desc->nb_objects < 1 || desc->nb_objects > AV_DRM_MAX_PLANES ||
+        desc->nb_layers != 1) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid DRM frame descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    for (int i = 0; i < desc->nb_objects; i++) {
+        const AVDRMObjectDescriptor *object = &desc->objects[i];
+
+        if (object->fd < 0 || object->size == 0) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid DRM object %d\n", i);
+            return AVERROR(EINVAL);
+        }
+    }
+
+    for (int i = 0; i < desc->nb_layers; i++) {
+        const AVDRMLayerDescriptor *layer = &desc->layers[i];
+
+        if (layer->nb_planes < 1 || layer->nb_planes > AV_DRM_MAX_PLANES) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid DRM layer %d descriptor\n", i);
+            return AVERROR(EINVAL);
+        }
+
+        for (int j = 0; j < layer->nb_planes; j++) {
+            const AVDRMPlaneDescriptor *plane = &layer->planes[j];
+            int object_index = plane->object_index;
+
+            if (object_index < 0 || object_index >= desc->nb_objects ||
+                plane->offset < 0 || plane->pitch <= 0 ||
+                (size_t)plane->offset >= desc->objects[object_index].size) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "Invalid DRM plane descriptor in layer %d plane %d\n", i, j);
+                return AVERROR(EINVAL);
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int validate_linear_drm_layer(AVFilterContext *avctx,
+                                     const AVDRMLayerDescriptor *layer,
+                                     enum AVPixelFormat pix_fmt)
+{
+    uint32_t drm_fmt = get_drm_linear_format(pix_fmt);
+    int nb_planes = av_pix_fmt_count_planes(pix_fmt);
+
+    if (drm_fmt == DRM_FORMAT_INVALID ||
+        nb_planes < 1 || nb_planes > AV_DRM_MAX_PLANES) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported DRM format for pixel format '%s'\n",
+               av_get_pix_fmt_name(pix_fmt));
+        return AVERROR(ENOSYS);
+    }
+
+    if (!layer || layer->format != drm_fmt || layer->nb_planes != nb_planes) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Input DRM format 0x%08"PRIx32" with %d planes does not match pixel format '%s'\n",
+               layer ? layer->format : 0, layer ? layer->nb_planes : 0,
+               av_get_pix_fmt_name(pix_fmt));
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
 }
 
 static void clear_unused_frames(RGAFrame *list)
@@ -621,8 +763,8 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     rkmpp_desc = get_rkmpp_drm_desc(rga_frame->frame);
     desc = rkmpp_desc ? &rkmpp_desc->drm_desc :
                         (AVDRMFrameDescriptor *)rga_frame->frame->data[0];
-    if (!desc || desc->nb_objects < 1 || desc->nb_layers < 1 ||
-        desc->layers[0].nb_planes < 1)
+    ret = validate_drm_desc_shape(ctx, desc);
+    if (ret < 0)
         goto fail;
 
     layer = &desc->layers[0];
@@ -637,6 +779,10 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         goto fail;
     is_fbc = is_afbc || is_rfbc;
     if (!is_fbc) {
+        ret = validate_linear_drm_layer(ctx, layer, in_info->pix_fmt);
+        if (ret < 0)
+            goto fail;
+
         ret = get_pixel_stride(object,
                                layer,
                                in_info->pix_fmt,
@@ -805,8 +951,8 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     }
 
     desc = (AVDRMFrameDescriptor *)out_frame->frame->data[0];
-    if (!desc || desc->nb_objects < 1 || desc->nb_layers < 1 ||
-        desc->layers[0].nb_planes < 1)
+    ret = validate_drm_desc_shape(ctx, desc);
+    if (ret < 0)
         goto fail;
 
     layer = &desc->layers[0];
@@ -831,6 +977,9 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     }
 
     is_afbc = r->afbc_out && !pat_preproc;
+    ret = validate_linear_drm_layer(ctx, layer, out_info->pix_fmt);
+    if (ret < 0)
+        goto fail;
     ret = get_pixel_stride(object,
                            layer,
                            out_info->pix_fmt,
@@ -1122,15 +1271,11 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
     }
     /* Input formats that requires RGA2 */
     if (!r->has_rga2 &&
-        (src->pix_fmt == AV_PIX_FMT_GRAY8 ||
-         src->pix_fmt == AV_PIX_FMT_YUV420P ||
-         src->pix_fmt == AV_PIX_FMT_YUVJ420P ||
-         src->pix_fmt == AV_PIX_FMT_YUV422P ||
-         src->pix_fmt == AV_PIX_FMT_YUVJ422P ||
-         src->pix_fmt == AV_PIX_FMT_RGB555LE ||
-         src->pix_fmt == AV_PIX_FMT_BGR555LE)) {
+        (is_rga2_only_input_format(src->pix_fmt) ||
+         (pat && is_rga2_only_input_format(pat->pix_fmt)))) {
         av_log(avctx, AV_LOG_ERROR, "'%s' as input is only supported by RGA2\n",
-               av_get_pix_fmt_name(src->pix_fmt));
+               av_get_pix_fmt_name(is_rga2_only_input_format(src->pix_fmt) ?
+                                   src->pix_fmt : pat->pix_fmt));
         return AVERROR(ENOSYS);
     }
     /* Output formats that requires RGA2 */
@@ -1195,15 +1340,9 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return AVERROR(ENOSYS);
     }
 
-    if (src->pix_fmt == AV_PIX_FMT_GRAY8 ||
-        src->pix_fmt == AV_PIX_FMT_YUV420P ||
-        src->pix_fmt == AV_PIX_FMT_YUVJ420P ||
-        src->pix_fmt == AV_PIX_FMT_YUV422P ||
-        src->pix_fmt == AV_PIX_FMT_YUVJ422P ||
+    if (is_rga2_only_input_format(src->pix_fmt) ||
         src->pix_fmt == AV_PIX_FMT_NV24 ||
         src->pix_fmt == AV_PIX_FMT_NV42 ||
-        src->pix_fmt == AV_PIX_FMT_RGB555LE ||
-        src->pix_fmt == AV_PIX_FMT_BGR555LE ||
         dst->pix_fmt == AV_PIX_FMT_GRAY8 ||
         dst->pix_fmt == AV_PIX_FMT_YUV420P ||
         dst->pix_fmt == AV_PIX_FMT_YUVJ420P ||
@@ -1216,11 +1355,17 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         dst->pix_fmt == AV_PIX_FMT_ARGB ||
         dst->pix_fmt == AV_PIX_FMT_0RGB ||
         dst->pix_fmt == AV_PIX_FMT_ABGR ||
-        dst->pix_fmt == AV_PIX_FMT_0BGR) {
+        dst->pix_fmt == AV_PIX_FMT_0BGR ||
+        (pat && is_rga2_only_input_format(pat->pix_fmt))) {
         r->is_rga2_used = 1;
     }
 
     r->is_rga2_used = r->is_rga2_used || !r->has_rga3;
+    if (pat && r->is_rga2_used && is_rga3_only_input_format(pat->pix_fmt)) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' overlay input is not supported if RGA2 is requested\n",
+               av_get_pix_fmt_name(pat->pix_fmt));
+        return AVERROR(ENOSYS);
+    }
     if (r->has_rga3) {
         if (scale_ratio_w < 0.125f ||
             scale_ratio_w > 8.0f ||
@@ -1245,9 +1390,11 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return ret;
 
     if (r->is_rga2_used) {
-        r->scheduler_core = 0x4;
-        if (r->has_rga2p)
-            r->scheduler_core |= 0x8;
+        if (!is_rga2_core_mask(r->scheduler_core)) {
+            r->scheduler_core = 0x4;
+            if (r->has_rga2p)
+                r->scheduler_core |= 0x8;
+        }
     }
 
     /* Prioritize RGA3 on multicore RGA hw to avoid dma32 & algorithm quirks as much as possible */
