@@ -770,8 +770,8 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     if (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
         MppFrameRational sar = mpp_frame_get_sar(mpp_frame);
-        frame->sample_aspect_ratio = av_div_q((AVRational) { sar.num, sar.den },
-                                              (AVRational) { frame->width, frame->height });
+        if (sar.num > 0 && sar.den > 0)
+            frame->sample_aspect_ratio = (AVRational) { sar.num, sar.den };
     }
 
     if ((avctx->codec_id == AV_CODEC_ID_HEVC ||

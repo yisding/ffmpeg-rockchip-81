@@ -175,8 +175,6 @@ static av_cold int eval_expr(AVFilterContext *ctx,
     /* calc again in case cx is relative to cy */
     CALC_EXPR(cx_expr, var_values[VAR_CX], *ret_cx, (var_values[VAR_IW] - var_values[VAR_CW]) / 2);
 
-    r->crop = (*ret_cw != var_values[VAR_IW]) || (*ret_ch != var_values[VAR_IH]);
-
 release:
     av_expr_free(w_expr);
     av_expr_free(h_expr);
@@ -216,6 +214,8 @@ static av_cold int set_size_info(AVFilterContext *ctx,
     r->act_y = FFMIN(r->act_y, inlink->h - r->act_h);
     r->act_w = FFMIN(r->act_w, inlink->w - r->act_x);
     r->act_h = FFMIN(r->act_h, inlink->h - r->act_y);
+    r->crop = r->act_x || r->act_y ||
+              r->act_w != inlink->w || r->act_h != inlink->h;
     src_w = r->act_w;
     src_h = r->act_h;
 
