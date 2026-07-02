@@ -122,6 +122,7 @@ overlay:
 
 static int get_pixel_stride(const AVDRMObjectDescriptor *object,
                             const AVDRMLayerDescriptor *layer,
+                            enum AVPixelFormat pix_fmt,
                             int is_rgb, int is_planar,
                             float bytes_pp, int *ws, int *hs)
 {
@@ -137,9 +138,27 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
     if (plane0->pitch <= 0)
         return AVERROR(EINVAL);
 
-    *ws = is_packed_fmt ?
-        (plane0->pitch / bytes_pp) :
-        plane0->pitch;
+    if (is_packed_fmt) {
+        *ws = plane0->pitch / bytes_pp;
+    } else {
+        switch (pix_fmt) {
+        case AV_PIX_FMT_P010:
+        case AV_PIX_FMT_P210:
+            if (plane0->pitch % 2)
+                return AVERROR(EINVAL);
+            *ws = plane0->pitch / 2;
+            break;
+        case AV_PIX_FMT_NV15:
+        case AV_PIX_FMT_NV20_PACKED:
+            if ((int64_t)plane0->pitch * 8 % 10)
+                return AVERROR(EINVAL);
+            *ws = (int64_t)plane0->pitch * 8 / 10;
+            break;
+        default:
+            *ws = plane0->pitch;
+            break;
+        }
+    }
     *hs = is_packed_fmt ?
         ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2) :
         (plane1->offset / plane0->pitch);
@@ -235,6 +254,31 @@ static void clear_frame_list(RGAFrame **list)
         av_frame_free(&frame->frame);
         av_freep(&frame);
     }
+}
+
+static void release_frame(RGAFrame *frame)
+{
+    if (!frame)
+        return;
+
+    av_frame_free(&frame->frame);
+    frame->queued = 0;
+    frame->locked = 0;
+}
+
+static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
+{
+    if (!frame || !frame->data[0])
+        return NULL;
+
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
+        if (frame->buf[i] &&
+            frame->buf[i]->data == frame->data[0] &&
+            frame->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor))
+            return (const AVRKMPPDRMFrameDescriptor *)frame->data[0];
+    }
+
+    return NULL;
 }
 
 static RGAFrame *get_free_frame(RGAFrame **list)
@@ -416,6 +460,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     RGAFrameInfo *in_info = &r->in_rga_frame_infos[nb_link];
     RGAFrameInfo *out_info = &r->out_rga_frame_info;
     int w_stride = 0, h_stride = 0;
+    const AVRKMPPDRMFrameDescriptor *rkmpp_desc = NULL;
     const AVDRMFrameDescriptor *desc;
     const AVDRMLayerDescriptor *layer;
     const AVDRMPlaneDescriptor *plane0;
@@ -437,15 +482,18 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 
     if (picref->format != AV_PIX_FMT_DRM_PRIME) {
         av_log(ctx, AV_LOG_ERROR, "RGA gets a wrong frame\n");
-        return NULL;
+        goto fail;
     }
     rga_frame->frame = av_frame_clone(picref);
     if (!rga_frame->frame)
-        return NULL;
+        goto fail;
 
-    desc = (AVDRMFrameDescriptor *)rga_frame->frame->data[0];
-    if (desc->objects[0].fd < 0)
-        return NULL;
+    rkmpp_desc = get_rkmpp_drm_desc(rga_frame->frame);
+    desc = rkmpp_desc ? &rkmpp_desc->drm_desc :
+                        (AVDRMFrameDescriptor *)rga_frame->frame->data[0];
+    if (!desc || desc->nb_objects < 1 || desc->nb_layers < 1 ||
+        desc->layers[0].nb_planes < 1 || desc->objects[0].fd < 0)
+        goto fail;
 
     is_afbc = drm_is_afbc(desc->objects[0].format_modifier);
     is_rfbc = drm_is_rfbc(desc->objects[0].format_modifier);
@@ -453,12 +501,13 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     if (!is_fbc) {
         ret = get_pixel_stride(&desc->objects[0],
                                &desc->layers[0],
+                               in_info->pix_fmt,
                                (in_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
                                (in_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
                                in_info->bytes_pp, &w_stride, &h_stride);
         if (ret < 0 || !w_stride || !h_stride) {
             av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
-            return NULL;
+            goto fail;
         }
     }
 
@@ -478,7 +527,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     if (is_fbc && !r->has_rga2p && (r->is_rga2_used || out_info->scheduler_core == 0x4)) {
         av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported by RGA2 (non-Pro)\n",
                av_get_pix_fmt_name(in_info->pix_fmt));
-        return NULL;
+        goto fail;
     }
 
     /* verify inputs pixel stride */
@@ -491,7 +540,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         }
 
         if ((ret = verify_rga_frame_info_io_dynamic(ctx, in_info, out_info)) < 0)
-            return NULL;
+            goto fail;
 
         if (r->is_rga2_used)
             out_info->scheduler_core = 0x4;
@@ -517,8 +566,8 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         uint32_t drm_fbc_fmt =
             is_afbc ? get_drm_afbc_format(in_info->pix_fmt) : get_drm_rfbc_format(in_info->pix_fmt);
 
-        if (rga_frame->frame->crop_top > 0) {
-            afbc_offset_y = is_afbc ? rga_frame->frame->crop_top : 0;
+        if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
+            afbc_offset_y = is_afbc ? rkmpp_desc->afbc_offset_y : 0;
             info.rect.yoffset += afbc_offset_y;
         }
 
@@ -527,7 +576,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         if (drm_fbc_fmt == layer->format) {
             info.rect.wstride = plane0->pitch;
             if ((ret = get_afbc_pixel_stride(in_info->bytes_pp, &info.rect.wstride, 1)) < 0)
-                return NULL;
+                goto fail;
 
             if (info.rect.wstride % fbc_align_w)
                 info.rect.wstride = FFALIGN(inlink->w, fbc_align_w);
@@ -536,7 +585,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         } else {
             av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC/RFBC modifier is not supported\n",
                    av_get_pix_fmt_name(in_info->pix_fmt));
-            return NULL;
+            goto fail;
         }
 
         info.rd_mode =
@@ -547,6 +596,10 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     rga_frame->info = info;
 
     return rga_frame;
+
+fail:
+    release_frame(rga_frame);
+    return NULL;
 }
 
 static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
@@ -589,7 +642,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
 
     out_frame->frame = av_frame_alloc();
     if (!out_frame->frame)
-        return NULL;
+        goto fail;
 
     if (in && (ret = av_frame_copy_props(out_frame->frame, in)) < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to copy metadata fields from in to out: %d\n", ret);
@@ -603,14 +656,14 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         (in0_info->rotate_mode & 0x07) == 0x07 /* HAL_TRANSFORM_ROT_270 */) {
         av_reduce(&out_frame->frame->sample_aspect_ratio.den,
                   &out_frame->frame->sample_aspect_ratio.num,
-                  (int64_t)in->sample_aspect_ratio.num * outlink->w * inlink->w,
-                  (int64_t)in->sample_aspect_ratio.den * outlink->h * inlink->h,
+                  (int64_t)in->sample_aspect_ratio.num * outlink->w * in0_info->act_w,
+                  (int64_t)in->sample_aspect_ratio.den * outlink->h * in0_info->act_h,
                   INT_MAX);
     } else {
         av_reduce(&out_frame->frame->sample_aspect_ratio.num,
                   &out_frame->frame->sample_aspect_ratio.den,
-                  (int64_t)in->sample_aspect_ratio.num * outlink->h * inlink->w,
-                  (int64_t)in->sample_aspect_ratio.den * outlink->w * inlink->h,
+                  (int64_t)in->sample_aspect_ratio.num * outlink->h * in0_info->act_w,
+                  (int64_t)in->sample_aspect_ratio.den * outlink->w * in0_info->act_h,
                   INT_MAX);
     }
 
@@ -638,6 +691,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     is_afbc = r->afbc_out && !pat_preproc;
     ret = get_pixel_stride(&desc->objects[0],
                            &desc->layers[0],
+                           out_info->pix_fmt,
                            (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
                            (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
                            out_info->bytes_pp, &w_stride, &h_stride);
@@ -748,8 +802,7 @@ exit:
     return out_frame;
 
 fail:
-    if (out_frame && out_frame->frame)
-        av_frame_free(&out_frame->frame);
+    release_frame(out_frame);
 
     return NULL;
 }
@@ -1204,6 +1257,12 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         r->in_rga_frame_infos[1].overlay_x = param->overlay_x;
         r->in_rga_frame_infos[1].overlay_y = param->overlay_y;
 
+        if (param->overlay_x < 0 || param->overlay_y < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Negative overlay offsets are not supported\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
         r->is_overlay_offset_valid = (param->overlay_x >= 0) &&
             (param->overlay_y >= 0) &&
             (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
@@ -1320,7 +1379,7 @@ static int call_rkrga_blit(AVFilterContext *avctx,
         return AVERROR_EXTERNAL;
     }
     if (dst_info->sync_mode == RGA_BLIT_ASYNC &&
-        dst_info->out_fence_fd <= 0) {
+        dst_info->out_fence_fd < 0) {
         av_log(avctx, AV_LOG_ERROR, "RGA async blit returned invalid fence_fd: %d\n",
                dst_info->out_fence_fd);
         return AVERROR_EXTERNAL;
@@ -1339,6 +1398,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     RGAFrame *src_frame = NULL;
     RGAFrame *dst_frame = NULL;
     RGAFrame *pat_frame = NULL;
+    RGAFrame *pat_in = NULL;
+    RGAFrame *pat_out = NULL;
     int ret, filter_ret;
     int do_overlay = ctx->nb_inputs > 1 &&
                      r->is_overlay_offset_valid &&
@@ -1355,8 +1416,12 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         /* ff_filter_frame consumes the frame even on failure */
         aframe.dst->frame = NULL;
         aframe.dst->queued--;
-        if (filter_ret < 0)
+        if (filter_ret < 0) {
+            release_frame(aframe.src);
+            release_frame(aframe.dst);
+            release_frame(aframe.pat);
             return filter_ret;
+        }
         r->got_frame = 1;
     }
 
@@ -1373,7 +1438,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     /* DST */
     if (!(dst_frame = query_frame(r, outlink, src_frame->frame, picref_pat, 0))) {
         av_log(ctx, AV_LOG_ERROR, "Failed to query an output frame\n");
-        return AVERROR(ENOMEM);
+        ret = AVERROR(ENOMEM);
+        goto fail;
     }
 
     /* PAT */
@@ -1381,8 +1447,6 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         RGAFrameInfo *in0_info = &r->in_rga_frame_infos[0];
         RGAFrameInfo *in1_info = &r->in_rga_frame_infos[1];
         RGAFrameInfo *out_info = &r->out_rga_frame_info;
-        RGAFrame *pat_in = NULL;
-        RGAFrame *pat_out = NULL;
         int pat_preprocessed = 0;
 
         /* translate PAT from top-left to (x,y) on a new image with the same size of SRC */
@@ -1393,11 +1457,13 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
             if (!(pat_in = submit_frame(r, inlink_pat, picref_pat, 0, 1))) {
                 av_log(ctx, AV_LOG_ERROR, "Failed to submit frame on input: %d\n",
                        FF_INLINK_IDX(inlink_pat));
-                return AVERROR(ENOMEM);
+                ret = AVERROR(ENOMEM);
+                goto fail;
             }
             if (!(pat_out = query_frame(r, outlink, picref_pat, NULL, 1))) {
                 av_log(ctx, AV_LOG_ERROR, "Failed to query an output frame\n");
-                return AVERROR(ENOMEM);
+                ret = AVERROR(ENOMEM);
+                goto fail;
             }
             dst_frame->info.core = out_info->scheduler_core;
 
@@ -1408,7 +1474,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
             /* Sync Blit Pre-Proc */
             ret = call_rkrga_blit(ctx, &pat_in->info, &pat_out->info, NULL);
             if (ret < 0)
-                return ret;
+                goto fail;
 
             pat_frame = pat_out;
             pat_preprocessed = 1;
@@ -1417,7 +1483,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         if (!pat_frame && !(pat_frame = submit_frame(r, inlink_pat, picref_pat, 0, 0))) {
             av_log(ctx, AV_LOG_ERROR, "Failed to submit frame on input: %d\n",
                    FF_INLINK_IDX(inlink_pat));
-            return AVERROR(ENOMEM);
+            ret = AVERROR(ENOMEM);
+            goto fail;
         }
         dst_frame->info.core = out_info->scheduler_core;
 
@@ -1431,7 +1498,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
 
             ret = call_rkrga_blit(ctx, &src_copy_info, &dst_copy_info, NULL);
             if (ret < 0)
-                return ret;
+                goto fail;
 
             src_frame->info.rect.xoffset += in1_info->overlay_x;
             src_frame->info.rect.yoffset += in1_info->overlay_y;
@@ -1451,18 +1518,28 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
                           &dst_frame->info,
                           pat_frame ? &pat_frame->info : NULL);
     if (ret < 0)
-        return ret;
+        goto fail;
 
     dst_frame->queued++;
     aframe = (RGAAsyncFrame){ src_frame, dst_frame, pat_frame };
     set_rga_async_frame_lock_status(&aframe, 1);
-    av_fifo_write(r->async_fifo, &aframe, 1);
+    ret = av_fifo_write(r->async_fifo, &aframe, 1);
+    if (ret < 0) {
+        if (imsync(dst_frame->info.out_fence_fd) != IM_STATUS_SUCCESS)
+            av_log(ctx, AV_LOG_WARNING, "RGA sync failed\n");
+        set_rga_async_frame_lock_status(&aframe, 0);
+        goto fail;
+    }
 
     /* Sync & Retrieve */
     if (av_fifo_can_read(r->async_fifo) > r->async_depth) {
         av_fifo_read(r->async_fifo, &aframe, 1);
         if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS) {
             av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
+            set_rga_async_frame_lock_status(&aframe, 0);
+            release_frame(aframe.src);
+            release_frame(aframe.dst);
+            release_frame(aframe.pat);
             return AVERROR_EXTERNAL;
         }
         set_rga_async_frame_lock_status(&aframe, 0);
@@ -1471,10 +1548,23 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         /* ff_filter_frame consumes the frame even on failure */
         aframe.dst->frame = NULL;
         aframe.dst->queued--;
-        if (filter_ret < 0)
+        if (filter_ret < 0) {
+            release_frame(aframe.src);
+            release_frame(aframe.dst);
+            release_frame(aframe.pat);
             return filter_ret;
+        }
         r->got_frame = 1;
     }
 
     return 0;
+
+fail:
+    release_frame(src_frame);
+    release_frame(dst_frame);
+    release_frame(pat_in);
+    if (pat_out != pat_frame)
+        release_frame(pat_out);
+    release_frame(pat_frame);
+    return ret;
 }
