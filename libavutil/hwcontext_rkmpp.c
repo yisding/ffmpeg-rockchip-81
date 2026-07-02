@@ -196,6 +196,9 @@ static int rkmpp_get_aligned_linesize(enum AVPixelFormat pix_fmt, int width, int
         const int width_align_256_odds = FFALIGN(width, 256) | 256;
         return FFALIGN(width_align_256_odds * 10 / 8, 64);
     }
+    if ((pix_fmt == AV_PIX_FMT_NV24 ||
+         pix_fmt == AV_PIX_FMT_NV42) && plane)
+        return FFALIGN(width, 64) * 2;
 
     linesize = av_image_get_linesize(pix_fmt, width, plane);
 
