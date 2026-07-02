@@ -503,22 +503,16 @@ static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfm
     return v4l2_try_raw_format_v4l2(ctx, pixfmt, v4l2_fmt);
 }
 
-static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
+static int v4l2_get_raw_format_from_enum(V4L2Context* ctx,
+                                         enum AVPixelFormat requested_pixfmt,
+                                         enum AVPixelFormat *p)
 {
-    enum AVPixelFormat pixfmt = ctx->av_pix_fmt;
+    enum AVPixelFormat pixfmt;
     struct v4l2_fmtdesc fdesc;
     int ret;
 
     memset(&fdesc, 0, sizeof(fdesc));
     fdesc.type = ctx->type;
-
-    if (pixfmt != AV_PIX_FMT_NONE) {
-        ret = v4l2_try_raw_format(ctx, pixfmt);
-        if (!ret) {
-            *p = pixfmt;
-            return 0;
-        }
-    }
 
     for (;;) {
         ret = ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_ENUM_FMT, &fdesc);
@@ -526,13 +520,14 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
             return AVERROR(EINVAL);
 
         pixfmt = ff_v4l2_format_v4l2_to_avfmt(fdesc.pixelformat, AV_CODEC_ID_RAWVIDEO);
-        if (pixfmt == AV_PIX_FMT_NONE) {
+        if (pixfmt == AV_PIX_FMT_NONE ||
+            (requested_pixfmt != AV_PIX_FMT_NONE && pixfmt != requested_pixfmt)) {
             fdesc.index++;
             continue;
         }
 
         ret = v4l2_try_raw_format_v4l2(ctx, pixfmt, fdesc.pixelformat);
-        if (ret){
+        if (ret) {
             fdesc.index++;
             continue;
         }
@@ -543,6 +538,26 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
     }
 
     return AVERROR(EINVAL);
+}
+
+static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
+{
+    enum AVPixelFormat pixfmt = ctx->av_pix_fmt;
+    int ret;
+
+    if (pixfmt != AV_PIX_FMT_NONE) {
+        ret = v4l2_try_raw_format(ctx, pixfmt);
+        if (!ret) {
+            *p = pixfmt;
+            return 0;
+        }
+
+        ret = v4l2_get_raw_format_from_enum(ctx, pixfmt, p);
+        if (!ret)
+            return 0;
+    }
+
+    return v4l2_get_raw_format_from_enum(ctx, AV_PIX_FMT_NONE, p);
 }
 
 static int v4l2_get_coded_format(V4L2Context* ctx, uint32_t *p)
