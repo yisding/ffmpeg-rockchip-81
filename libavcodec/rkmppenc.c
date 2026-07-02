@@ -118,6 +118,12 @@ static uint32_t rkmpp_get_drm_afbc_format(MppFrameFormat mpp_fmt)
     }
 }
 
+static int rkmpp_is_supported_afbc_modifier(uint64_t modifier)
+{
+    return modifier == DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE |
+                                               AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
+}
+
 static uint32_t rkmpp_get_drm_format(enum AVPixelFormat pix_fmt)
 {
     switch (pix_fmt) {
@@ -583,7 +589,7 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR(EINVAL);
 
     pix_desc = av_pix_fmt_desc_get(r->pix_fmt);
-    is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
+    is_afbc = rkmpp_is_supported_afbc_modifier(drm_desc->objects[0].format_modifier);
     is_fbc  = is_afbc;
     if (!is_fbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
@@ -1125,7 +1131,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     layer = &drm_desc->layers[0];
     plane0 = &layer->planes[0];
 
-    is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
+    is_afbc = rkmpp_is_supported_afbc_modifier(drm_desc->objects[0].format_modifier);
     is_fbc  = is_afbc;
     if (!is_fbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {

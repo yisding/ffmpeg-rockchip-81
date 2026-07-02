@@ -427,6 +427,13 @@ static int mmap_init(AVFormatContext *ctx)
         }
 
         plane_count = s->multiplanar ? buf.length : 1;
+        if (plane_count < 1 || plane_count > VIDEO_MAX_PLANES) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Invalid plane count %d for buffer %d\n",
+                   plane_count, i);
+            res = AVERROR(EINVAL);
+            goto fail;
+        }
         if (s->plane_count && s->plane_count != plane_count) {
             av_log(ctx, AV_LOG_ERROR, "Plane count differed between buffers\n");
             res = AVERROR(EINVAL);

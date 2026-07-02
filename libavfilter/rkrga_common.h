@@ -53,7 +53,6 @@ typedef struct RGAFrameInfo {
     enum _Rga_SURF_FORMAT     rga_fmt;
     enum AVPixelFormat        pix_fmt;
     const AVPixFmtDescriptor *pix_desc;
-    float                     bytes_pp;
     int                       act_x;
     int                       act_y;
     int                       act_w;
