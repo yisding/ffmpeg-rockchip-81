@@ -51,6 +51,21 @@ static const struct fmt_conversion {
     { AV_FMT(YUV410P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV410) },
     { AV_FMT(YUV410P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YVU410) },
     { AV_FMT(NV12),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV12) },
+#ifdef V4L2_PIX_FMT_NV21
+    { AV_FMT(NV21),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV21) },
+#endif
+#ifdef V4L2_PIX_FMT_NV15
+    { AV_FMT(NV15),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV15) },
+#endif
+#ifdef V4L2_PIX_FMT_NV16
+    { AV_FMT(NV16),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV16) },
+#endif
+#ifdef V4L2_PIX_FMT_NV20
+    { AV_FMT(NV20_PACKED), AV_CODEC(RAWVIDEO),    V4L2_FMT(NV20) },
+#endif
+#ifdef V4L2_PIX_FMT_NV24
+    { AV_FMT(NV24),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV24) },
+#endif
     { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(MJPEG) },
     { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(JPEG) },
 #ifdef V4L2_PIX_FMT_SRGGB8
@@ -70,6 +85,12 @@ static const struct fmt_conversion {
 #endif
 #ifdef V4L2_PIX_FMT_YUV420M
     { AV_FMT(YUV420P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV420M) },
+#endif
+#ifdef V4L2_PIX_FMT_YUV422M
+    { AV_FMT(YUV422P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV422M) },
+#endif
+#ifdef V4L2_PIX_FMT_YUV444M
+    { AV_FMT(YUV444P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV444M) },
 #endif
 #ifdef V4L2_PIX_FMT_NV16M
     { AV_FMT(NV16),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV16M) },
@@ -109,6 +130,33 @@ static const struct fmt_conversion {
 #endif
 };
 
+static int v4l2_format_is_multiplanar(uint32_t v4l2_fmt)
+{
+    switch (v4l2_fmt) {
+#ifdef V4L2_PIX_FMT_NV12M
+    case V4L2_PIX_FMT_NV12M:
+#endif
+#ifdef V4L2_PIX_FMT_NV21M
+    case V4L2_PIX_FMT_NV21M:
+#endif
+#ifdef V4L2_PIX_FMT_YUV420M
+    case V4L2_PIX_FMT_YUV420M:
+#endif
+#ifdef V4L2_PIX_FMT_YUV422M
+    case V4L2_PIX_FMT_YUV422M:
+#endif
+#ifdef V4L2_PIX_FMT_YUV444M
+    case V4L2_PIX_FMT_YUV444M:
+#endif
+#ifdef V4L2_PIX_FMT_NV16M
+    case V4L2_PIX_FMT_NV16M:
+#endif
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 uint32_t ff_v4l2_format_avcodec_to_v4l2(enum AVCodecID avcodec)
 {
     int i;
@@ -127,6 +175,23 @@ uint32_t ff_v4l2_format_avfmt_to_v4l2(enum AVPixelFormat avfmt)
             return fmt_map[i].v4l2_fmt;
     }
     return 0;
+}
+
+uint32_t ff_v4l2_format_avfmt_to_v4l2_type(enum AVPixelFormat avfmt,
+                                            int multiplanar)
+{
+    uint32_t fallback = 0;
+    int i;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(fmt_map); i++) {
+        if (fmt_map[i].avfmt == avfmt) {
+            if (v4l2_format_is_multiplanar(fmt_map[i].v4l2_fmt) == !!multiplanar)
+                return fmt_map[i].v4l2_fmt;
+            if (!fallback)
+                fallback = fmt_map[i].v4l2_fmt;
+        }
+    }
+    return fallback;
 }
 
 enum AVPixelFormat ff_v4l2_format_v4l2_to_avfmt(uint32_t v4l2_fmt, enum AVCodecID avcodec)
