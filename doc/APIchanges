@@ -1,6 +1,10 @@
-The last version increases of all libraries were on 2026-06-23.
+The last version increases of all libraries were on 2026-07-02.
 
 API changes, most recent first:
+
+2026-07-02 - xxxxxxxxxxx - lavu 61.3.100 - pixfmt.h hwcontext.h
+  Add AV_PIX_FMT_NV15 and AV_PIX_FMT_NV20_PACKED.
+  Add AV_HWDEVICE_TYPE_RKMPP.
 
 2026-06-23 - 61693f6c35f - lavu 60.34.100 - hwcontext_vulkan.h
   Switch AVVkFrame.access to VkAccessFlagBits2.
