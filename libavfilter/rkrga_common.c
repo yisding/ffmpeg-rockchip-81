@@ -1192,7 +1192,7 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
             need_premultiply = param->in_alpha_format == 0;
 
         /* IM_ALPHA_BLEND_DST_OVER */
-        if (param->in_global_alpha > 0 && param->in_global_alpha < 0xff) {
+        if (param->in_global_alpha >= 0 && param->in_global_alpha < 0xff) {
             r->in_rga_frame_infos[0].blend_mode = need_premultiply ? (0x4 | (1 << 12)) : 0x4;
             r->in_rga_frame_infos[0].blend_mode |= (param->in_global_alpha & 0xff) << 16; /* fg_global_alpha */
             r->in_rga_frame_infos[0].blend_mode |= 0xff << 24;                            /* bg_global_alpha */
