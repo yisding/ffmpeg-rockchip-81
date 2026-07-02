@@ -175,49 +175,32 @@ static int rkmpp_mjpeg_output_buffer_size(AVCodecContext *avctx,
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
                                 int *stride, int reverse)
 {
-    int64_t scaled_stride;
-    int64_t divisor = 1;
+    int bpp;
+    int64_t bits;
 
     if (!desc || !stride || *stride <= 0)
         return AVERROR(EINVAL);
 
-    if (desc->nb_components == 1 ||
-        (desc->flags & AV_PIX_FMT_FLAG_RGB) ||
-        (!(desc->flags & AV_PIX_FMT_FLAG_RGB) &&
-         !(desc->flags & AV_PIX_FMT_FLAG_PLANAR)))
-        return 0;
-
-    scaled_stride = *stride;
-    if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1) {
-        if (reverse) {
-            scaled_stride *= 2;
-            divisor = 3;
-        } else {
-            scaled_stride *= 3;
-            divisor = 2;
-        }
-    } else if (desc->log2_chroma_w == 1 && !desc->log2_chroma_h) {
-        if (reverse)
-            divisor = 2;
-        else
-            scaled_stride *= 2;
-    } else if (!desc->log2_chroma_w && !desc->log2_chroma_h) {
-        if (reverse)
-            divisor = 3;
-        else
-            scaled_stride *= 3;
-    } else {
+    bpp = av_get_padded_bits_per_pixel(desc);
+    if (bpp <= 0)
         return AVERROR(EINVAL);
+
+    if (reverse) {
+        bits = (int64_t)*stride * 8;
+        if (bits % bpp)
+            return AVERROR(EINVAL);
+        bits /= bpp;
+    } else {
+        bits = (int64_t)*stride * bpp;
+        if (bits % 8)
+            return AVERROR(EINVAL);
+        bits /= 8;
     }
 
-    if (scaled_stride % divisor)
+    if (bits <= 0 || bits > INT_MAX)
         return AVERROR(EINVAL);
 
-    scaled_stride /= divisor;
-    if (scaled_stride <= 0 || scaled_stride > INT_MAX)
-        return AVERROR(EINVAL);
-
-    *stride = scaled_stride;
+    *stride = bits;
     return 0;
 }
 
@@ -1012,6 +995,23 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         avctx->coded_width  = FFALIGN(avctx->width,  64);
         avctx->coded_height = FFALIGN(avctx->height, 64);
         rkmpp_export_avctx_color_props(avctx, mpp_frame);
+
+        if (r->afbc == RKMPP_DEC_AFBC_ON_RGA &&
+            !rkmpp_afbc_rga_supported(avctx->width, avctx->height, NULL)) {
+            MppFrameFormat output_fmt = MPP_FRAME_FBC_NONE;
+
+            av_log(avctx, AV_LOG_VERBOSE,
+                   "AFBC is requested without capable RGA for %dx%d, disabling\n",
+                   avctx->width, avctx->height);
+            r->afbc = RKMPP_DEC_AFBC_OFF;
+
+            ret = r->mapi->control(r->mctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_fmt);
+            if (ret != MPP_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to disable FBC mode: %d\n", ret);
+                ret = AVERROR_EXTERNAL;
+                goto exit;
+            }
+        }
 
         if (av_opt_serialize(r, 0, 0, &opts, '=', ' ') >= 0)
             av_log(avctx, AV_LOG_VERBOSE, "Decoder options: %s\n", opts);
