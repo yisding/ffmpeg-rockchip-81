@@ -204,7 +204,26 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
     return 0;
 }
 
+static int rkmpp_afbc_rga_format_supported(enum AVPixelFormat pix_fmt,
+                                           int has_rga2p, int has_rga3)
+{
+    switch (pix_fmt) {
+    case AV_PIX_FMT_NONE:
+        return has_rga2p || has_rga3;
+    case AV_PIX_FMT_NV12:
+    case AV_PIX_FMT_NV15:
+    case AV_PIX_FMT_NV16:
+    case AV_PIX_FMT_NV20_PACKED:
+        return has_rga2p || has_rga3;
+    case AV_PIX_FMT_NV24:
+        return has_rga2p;
+    default:
+        return 0;
+    }
+}
+
 static int rkmpp_afbc_rga_supported(int width, int height,
+                                    enum AVPixelFormat pix_fmt,
                                     int *has_rga2p)
 {
 #if CONFIG_RKRGA
@@ -212,25 +231,29 @@ static int rkmpp_afbc_rga_supported(int width, int height,
     int has_rga2p_local = !!strstr(rga_ver, "RGA_2_PRO");
     int has_rga3        = !!strstr(rga_ver, "RGA_3");
     int check_size      = width > 0 && height > 0;
-    int is_rga2p_compat = !check_size ||
-                          (width >= 2 &&
-                           width <= 8192 &&
-                           height >= 2 &&
-                           height <= 8192);
-    int is_rga3_compat  = !check_size ||
-                          (width >= 68 &&
-                           width <= 8176 &&
-                           height >= 2 &&
-                           height <= 8176);
+    int is_rga2p_compat = has_rga2p_local &&
+                          (!check_size ||
+                           (width >= 2 &&
+                            width <= 8192 &&
+                            height >= 2 &&
+                            height <= 8192));
+    int is_rga3_compat  = has_rga3 &&
+                          (!check_size ||
+                           (width >= 68 &&
+                            width <= 8176 &&
+                            height >= 2 &&
+                            height <= 8176));
 
     if (has_rga2p)
         *has_rga2p = has_rga2p_local;
 
-    return (has_rga2p_local && is_rga2p_compat) ||
-           (has_rga3 && is_rga3_compat);
+    return rkmpp_afbc_rga_format_supported(pix_fmt,
+                                           is_rga2p_compat,
+                                           is_rga3_compat);
 #else
     (void)width;
     (void)height;
+    (void)pix_fmt;
 
     if (has_rga2p)
         *has_rga2p = 0;
@@ -395,9 +418,8 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
         r->afbc = 0;
 
     if (r->afbc == RKMPP_DEC_AFBC_ON_RGA) {
-        int has_rga2p = 0;
-
-        if (!rkmpp_afbc_rga_supported(avctx->width, avctx->height, &has_rga2p)) {
+        if (!rkmpp_afbc_rga_supported(avctx->width, avctx->height,
+                                      AV_PIX_FMT_NONE, NULL)) {
             av_log(avctx, AV_LOG_VERBOSE, "AFBC is requested without capable RGA, ignoring\n");
             r->afbc = RKMPP_DEC_AFBC_OFF;
         }
@@ -997,12 +1019,14 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         rkmpp_export_avctx_color_props(avctx, mpp_frame);
 
         if (r->afbc == RKMPP_DEC_AFBC_ON_RGA &&
-            !rkmpp_afbc_rga_supported(avctx->width, avctx->height, NULL)) {
+            !rkmpp_afbc_rga_supported(avctx->width, avctx->height,
+                                      pix_fmts[1], NULL)) {
             MppFrameFormat output_fmt = MPP_FRAME_FBC_NONE;
 
             av_log(avctx, AV_LOG_VERBOSE,
-                   "AFBC is requested without capable RGA for %dx%d, disabling\n",
-                   avctx->width, avctx->height);
+                   "AFBC is requested without capable RGA for %dx%d %s, disabling\n",
+                   avctx->width, avctx->height,
+                   av_get_pix_fmt_name(pix_fmts[1]));
             r->afbc = RKMPP_DEC_AFBC_OFF;
 
             ret = r->mapi->control(r->mctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_fmt);
