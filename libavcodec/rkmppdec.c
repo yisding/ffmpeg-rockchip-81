@@ -352,9 +352,8 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
             avctx->codec_id == AV_CODEC_ID_HEVC ||
             avctx->codec_id == AV_CODEC_ID_MJPEG;
         break;
-    case AV_PIX_FMT_NONE: /* fallback to drm_prime */
+    case AV_PIX_FMT_NONE: /* negotiate via get_format, defaulting to NV12 */
         is_fmt_supported = 1;
-        avctx->pix_fmt = AV_PIX_FMT_DRM_PRIME;
         break;
     default:
         is_fmt_supported = 0;
@@ -904,7 +903,7 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
 {
     RKMPPDecContext *r = avctx->priv_data;
     MppFrame mpp_frame = NULL;
-    int ret;
+    int ret, corrupt = 0;
 
     /* should not provide any frame after EOS */
     if (r->eof)
@@ -974,8 +973,12 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             ret = AVERROR_INVALIDDATA;
             goto exit;
         }
-        ret = AVERROR(EAGAIN);
-        goto exit;
+        /* return decodable frames flagged as corrupt, drop buffer-less ones */
+        if (!mpp_frame_get_buffer(mpp_frame)) {
+            ret = AVERROR(EAGAIN);
+            goto exit;
+        }
+        corrupt = 1;
     }
 
     if ((r->info_change = mpp_frame_get_info_change(mpp_frame)) ||
@@ -1064,6 +1067,10 @@ export:
                 mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
                 if (ret < 0)
                     goto exit;
+                if (corrupt) {
+                    frame->flags |= AV_FRAME_FLAG_CORRUPT;
+                    frame->decode_error_flags |= FF_DECODE_ERROR_CONCEALMENT_ACTIVE;
+                }
                 return 0;
             }
             break;
@@ -1101,6 +1108,10 @@ export:
                     goto exit;
                 }
                 av_frame_free(&tmp_frame);
+                if (corrupt) {
+                    frame->flags |= AV_FRAME_FLAG_CORRUPT;
+                    frame->decode_error_flags |= FF_DECODE_ERROR_CONCEALMENT_ACTIVE;
+                }
                 return 0;
             }
             break;
@@ -1239,6 +1250,11 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
             ret = r->mapi->decode_put_packet(r->mctx, mpp_pkt);
             mpp_packet_deinit(&mpp_pkt);
             if (ret != MPP_OK) {
+                if (ret != MPP_NOK && ret != MPP_ERR_BUFFER_FULL) {
+                    av_log(avctx, AV_LOG_ERROR, "Failed to put extradata packet "
+                           "to decoder input queue: %d\n", ret);
+                    return AVERROR_EXTERNAL;
+                }
                 av_log(avctx, AV_LOG_TRACE, "Decoder buffer is full\n");
                 return AVERROR(EAGAIN);
             }
@@ -1271,6 +1287,9 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
             pts_diff = (avctx->pkt_timebase.den * framerate.den) /
                        (avctx->pkt_timebase.num * framerate.num);
         }
+        /* last_pts is AV_NOPTS_VALUE after a flush: restart fabrication at 0 */
+        if (last_pts == AV_NOPTS_VALUE)
+            last_pts = 0;
         last_pts += pts_diff;
 
         mpp_pkt_pts = PTS_TO_MPP_PTS(last_pts, avctx->pkt_timebase);
@@ -1327,9 +1346,14 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
     }
 
     if (ret != MPP_OK) {
-        av_log(avctx, AV_LOG_TRACE, "Decoder buffer is full\n");
         if (mpp_pkt)
             mpp_packet_deinit(&mpp_pkt);
+        if (ret != MPP_NOK && ret != MPP_ERR_BUFFER_FULL) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to put packet "
+                   "to decoder input queue: %d\n", ret);
+            return AVERROR_EXTERNAL;
+        }
+        av_log(avctx, AV_LOG_TRACE, "Decoder buffer is full\n");
         return AVERROR(EAGAIN);
     }
     if (avctx->codec_id == AV_CODEC_ID_MJPEG)

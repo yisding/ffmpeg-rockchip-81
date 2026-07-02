@@ -311,8 +311,10 @@ const FFCodec ff_##x##_rkmpp_encoder = { \
     .p.priv_class   = &x##_rkmpp_encoder_class, \
     .init           = rkmpp_encode_init, \
     .close          = rkmpp_encode_close, \
+    .flush          = rkmpp_encode_flush, \
     FF_CODEC_ENCODE_CB(rkmpp_encode_frame), \
-    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE, \
+    .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE | \
+                      AV_CODEC_CAP_ENCODER_FLUSH, \
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
                       FF_CODEC_CAP_INIT_CLEANUP, \
     CODEC_PIXFMTS_ARRAY(rkmpp_enc_pix_fmts_##xx), \
