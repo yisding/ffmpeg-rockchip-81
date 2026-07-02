@@ -1199,10 +1199,12 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         } else
             r->in_rga_frame_infos[0].blend_mode = need_premultiply ? 0x504 : 0x501;
 
-        r->in_rga_frame_infos[1].overlay_x = FFMAX(param->overlay_x, 0);
-        r->in_rga_frame_infos[1].overlay_y = FFMAX(param->overlay_y, 0);
+        r->in_rga_frame_infos[1].overlay_x = param->overlay_x;
+        r->in_rga_frame_infos[1].overlay_y = param->overlay_y;
 
-        r->is_overlay_offset_valid = (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
+        r->is_overlay_offset_valid = (param->overlay_x >= 0) &&
+            (param->overlay_y >= 0) &&
+            (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
             (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2);
         if (r->is_overlay_offset_valid)
             init_pat_preproc_hwframes_ctx(avctx);
@@ -1376,6 +1378,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         RGAFrameInfo *out_info = &r->out_rga_frame_info;
         RGAFrame *pat_in = NULL;
         RGAFrame *pat_out = NULL;
+        int pat_preprocessed = 0;
 
         /* translate PAT from top-left to (x,y) on a new image with the same size of SRC */
         if (in1_info->act_w != in0_info->act_w ||
@@ -1402,12 +1405,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
             if (ret < 0)
                 return ret;
 
-            pat_out->info.rect.xoffset = 0;
-            pat_out->info.rect.yoffset = 0;
-            pat_out->info.rect.width   = in0_info->act_w;
-            pat_out->info.rect.height  = in0_info->act_h;
-
             pat_frame = pat_out;
+            pat_preprocessed = 1;
         }
 
         if (!pat_frame && !(pat_frame = submit_frame(r, inlink_pat, picref_pat, 0, 0))) {
@@ -1416,6 +1415,29 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
             return AVERROR(ENOMEM);
         }
         dst_frame->info.core = out_info->scheduler_core;
+
+        if (pat_preprocessed) {
+            rga_info_t src_copy_info = src_frame->info;
+            rga_info_t dst_copy_info = dst_frame->info;
+
+            src_copy_info.blend = 0;
+            dst_copy_info.sync_mode = RGA_BLIT_SYNC;
+            dst_copy_info.out_fence_fd = -1;
+
+            ret = call_rkrga_blit(ctx, &src_copy_info, &dst_copy_info, NULL);
+            if (ret < 0)
+                return ret;
+
+            src_frame->info.rect.xoffset += in1_info->overlay_x;
+            src_frame->info.rect.yoffset += in1_info->overlay_y;
+            src_frame->info.rect.width    = pat_frame->info.rect.width;
+            src_frame->info.rect.height   = pat_frame->info.rect.height;
+
+            dst_frame->info.rect.xoffset += in1_info->overlay_x;
+            dst_frame->info.rect.yoffset += in1_info->overlay_y;
+            dst_frame->info.rect.width    = pat_frame->info.rect.width;
+            dst_frame->info.rect.height   = pat_frame->info.rect.height;
+        }
     }
 
     /* Async Blit */

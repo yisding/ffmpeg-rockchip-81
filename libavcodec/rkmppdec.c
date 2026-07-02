@@ -231,6 +231,41 @@ static void read_soc_name(AVCodecContext *avctx, char *name, int size)
     }
 }
 
+static int rkmpp_afbc_rga_supported(int width, int height,
+                                    int *has_rga2p)
+{
+#if CONFIG_RKRGA
+    const char *rga_ver = querystring(RGA_VERSION);
+    int has_rga2p_local = !!strstr(rga_ver, "RGA_2_PRO");
+    int has_rga3        = !!strstr(rga_ver, "RGA_3");
+    int check_size      = width > 0 && height > 0;
+    int is_rga2p_compat = !check_size ||
+                          (width >= 2 &&
+                           width <= 8192 &&
+                           height >= 2 &&
+                           height <= 8192);
+    int is_rga3_compat  = !check_size ||
+                          (width >= 68 &&
+                           width <= 8176 &&
+                           height >= 2 &&
+                           height <= 8176);
+
+    if (has_rga2p)
+        *has_rga2p = has_rga2p_local;
+
+    return (has_rga2p_local && is_rga2p_compat) ||
+           (has_rga3 && is_rga3_compat);
+#else
+    (void)width;
+    (void)height;
+
+    if (has_rga2p)
+        *has_rga2p = 0;
+
+    return 0;
+#endif
+}
+
 static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
 {
     RKMPPDecContext *r = avctx->priv_data;
@@ -395,27 +430,14 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
     }
 
     if (r->afbc == RKMPP_DEC_AFBC_ON_RGA) {
-#if CONFIG_RKRGA
-        const char *rga_ver = querystring(RGA_VERSION);
-        int has_rga2p = !!strstr(rga_ver, "RGA_2_PRO");
-        int has_rga3  = !!strstr(rga_ver, "RGA_3");
-        int is_rga2p_compat = avctx->width >= 2 &&
-                              avctx->width <= 8192 &&
-                              avctx->height >= 2 &&
-                              avctx->height <= 8192;
-        int is_rga3_compat  = avctx->width >= 68 &&
-                              avctx->width <= 8176 &&
-                              avctx->height >= 2 &&
-                              avctx->height <= 8176;
+        int has_rga2p = 0;
 
-        r->use_rfbc = r->use_rfbc || has_rga2p;
-        if (!((has_rga2p && is_rga2p_compat) || (has_rga3 && is_rga3_compat))) {
-#endif
+        if (!rkmpp_afbc_rga_supported(avctx->width, avctx->height, &has_rga2p)) {
             av_log(avctx, AV_LOG_VERBOSE, "AFBC is requested without capable RGA, ignoring\n");
             r->afbc = RKMPP_DEC_AFBC_OFF;
-#if CONFIG_RKRGA
+        } else {
+            r->use_rfbc = r->use_rfbc || has_rga2p;
         }
-#endif
     }
 
     if (r->afbc) {
