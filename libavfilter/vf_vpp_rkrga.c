@@ -402,8 +402,7 @@ static av_cold void config_force_format(AVFilterContext *ctx,
     use_rga2 = !has_rga3 ||
                use_rga2_core ||
                vpp_input_forces_rga2(in_format) ||
-               (r->force_yuv == FORCE_YUV_AUTO &&
-                vpp_compact_10bit_input(in_format)) ||
+               vpp_compact_10bit_input(in_format) ||
                vpp_source_size_forces_rga2(src_width, src_height) ||
                vpp_output_size_forces_rga2(out_width, out_height) ||
                vpp_scale_forces_rga2(src_width, src_height,
