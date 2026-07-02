@@ -605,12 +605,16 @@ static int is_rga2_only_input_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_YUVJ422P:
     case AV_PIX_FMT_RGB555LE:
     case AV_PIX_FMT_BGR555LE:
-    case AV_PIX_FMT_NV15:
-    case AV_PIX_FMT_NV20_PACKED:
         return 1;
     default:
         return 0;
     }
+}
+
+static int is_linear_rga2_only_input_format(enum AVPixelFormat pix_fmt)
+{
+    return pix_fmt == AV_PIX_FMT_NV15 ||
+           pix_fmt == AV_PIX_FMT_NV20_PACKED;
 }
 
 static int is_rga3_only_input_format(enum AVPixelFormat pix_fmt)
@@ -1216,6 +1220,17 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     if (!nb_link) {
         info.rotation = in_info->rotate_mode;
         info.blend    = (do_overlay && !pat_preproc) ? in_info->blend_mode : 0;
+    }
+
+    if (!is_fbc && is_linear_rga2_only_input_format(in_info->pix_fmt) &&
+        !r->is_rga2_used) {
+        if (!r->has_rga2) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Linear input format '%s' is only supported by RGA2\n",
+                   av_get_pix_fmt_name(in_info->pix_fmt));
+            goto fail;
+        }
+        select_rga2_core(r, out_info);
     }
 
     if (is_fbc && !r->has_rga2p &&
@@ -1931,7 +1946,8 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
 static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
                                                RGAFrameInfo *info,
                                                AVFilterLink *link,
-                                               int nb_link, int is_inlink)
+                                               int nb_link, int is_inlink,
+                                               int validate_format)
 {
     AVHWFramesContext *hwfc;
     FilterLink *l = ff_filter_link(link);
@@ -1942,7 +1958,8 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
 
     hwfc = (AVHWFramesContext *)l->hw_frames_ctx->data;
 
-    if (!map_av_to_rga_format(hwfc->sw_format, &info->rga_fmt, (is_inlink && nb_link > 0))) {
+    if (validate_format &&
+        !map_av_to_rga_format(hwfc->sw_format, &info->rga_fmt, (is_inlink && nb_link > 0))) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported '%s' pad %d format: '%s'\n",
                (is_inlink ? "input" : "output"), nb_link,
                av_get_pix_fmt_name(hwfc->sw_format));
@@ -1951,13 +1968,16 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
 
     info->pix_fmt  = hwfc->sw_format;
     info->pix_desc = av_pix_fmt_desc_get(info->pix_fmt);
+    if (!info->pix_desc)
+        return AVERROR(EINVAL);
     info->act_x    = 0;
     info->act_y    = 0;
     info->act_w    = link->w;
     info->act_h    = link->h;
 
     /* The w/h of RGA YUV image needs to be 2 aligned. */
-    if (!(info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB) &&
+    if (validate_format &&
+        !(info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB) &&
         ((info->act_w | info->act_h) & (RK_RGA_YUV_ALIGN - 1))) {
         av_log(avctx, AV_LOG_ERROR, "'%s' pad %d format '%s' requires even dimensions\n",
                is_inlink ? "input" : "output", nb_link,
@@ -2038,8 +2058,30 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    for (i = 0; i < avctx->nb_inputs; i++) {
-        ret = fill_rga_frame_info_by_link(avctx, &r->in_rga_frame_infos[i], avctx->inputs[i], i, 1);
+    ret = fill_rga_frame_info_by_link(avctx, &r->in_rga_frame_infos[0],
+                                      avctx->inputs[0], 0, 1, 1);
+    if (ret < 0)
+        goto fail;
+    if (avctx->nb_inputs > 1) {
+        if (param->overlay_x < 0 || param->overlay_y < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Negative overlay offsets are not supported\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
+        r->is_overlay_offset_valid =
+            param->overlay_x <= r->in_rga_frame_infos[0].act_w - 2 &&
+            param->overlay_y <= r->in_rga_frame_infos[0].act_h - 2;
+
+        ret = fill_rga_frame_info_by_link(avctx, &r->in_rga_frame_infos[1],
+                                          avctx->inputs[1], 1, 1,
+                                          r->is_overlay_offset_valid);
+        if (ret < 0)
+            goto fail;
+    }
+    for (i = 2; i < avctx->nb_inputs; i++) {
+        ret = fill_rga_frame_info_by_link(avctx, &r->in_rga_frame_infos[i],
+                                          avctx->inputs[i], i, 1, 1);
         if (ret < 0)
             goto fail;
     }
@@ -2066,7 +2108,8 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     if (avctx->nb_inputs > 1) {
         int need_premultiply = 0;
 
-        if (r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
+        if (r->is_overlay_offset_valid &&
+            r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
             need_premultiply = param->in_alpha_format == 0;
 
         /* IM_ALPHA_BLEND_DST_OVER */
@@ -2080,16 +2123,6 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         r->in_rga_frame_infos[1].overlay_x = param->overlay_x;
         r->in_rga_frame_infos[1].overlay_y = param->overlay_y;
 
-        if (param->overlay_x < 0 || param->overlay_y < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Negative overlay offsets are not supported\n");
-            ret = AVERROR(EINVAL);
-            goto fail;
-        }
-
-        r->is_overlay_offset_valid = (param->overlay_x >= 0) &&
-            (param->overlay_y >= 0) &&
-            (param->overlay_x <= r->in_rga_frame_infos[0].act_w - 2) &&
-            (param->overlay_y <= r->in_rga_frame_infos[0].act_h - 2);
         if (r->is_overlay_offset_valid) {
             ret = init_pat_preproc_hwframes_ctx(avctx);
             if (ret < 0)
@@ -2098,7 +2131,8 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     }
 
     /* OUT RGAFrameInfo */
-    ret = fill_rga_frame_info_by_link(avctx, &r->out_rga_frame_info, avctx->outputs[0], 0, 0);
+    ret = fill_rga_frame_info_by_link(avctx, &r->out_rga_frame_info,
+                                      avctx->outputs[0], 0, 0, 1);
     if (ret < 0)
         goto fail;
 

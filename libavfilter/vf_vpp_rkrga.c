@@ -90,8 +90,6 @@ static int vpp_input_forces_rga2(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_YUVJ422P:
     case AV_PIX_FMT_RGB555LE:
     case AV_PIX_FMT_BGR555LE:
-    case AV_PIX_FMT_NV15:
-    case AV_PIX_FMT_NV20_PACKED:
     case AV_PIX_FMT_NV24:
     case AV_PIX_FMT_NV42:
         return 1;
