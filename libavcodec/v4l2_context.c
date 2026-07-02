@@ -464,13 +464,13 @@ static int v4l2_release_buffers(V4L2Context* ctx)
     return ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_REQBUFS, &req);
 }
 
-static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfmt)
+static inline int v4l2_try_raw_format_v4l2(V4L2Context* ctx,
+                                           enum AVPixelFormat pixfmt,
+                                           uint32_t v4l2_fmt)
 {
     struct v4l2_format *fmt = &ctx->format;
-    uint32_t v4l2_fmt;
     int ret;
 
-    v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2(pixfmt);
     if (!v4l2_fmt)
         return AVERROR(EINVAL);
 
@@ -484,8 +484,23 @@ static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfm
     ret = ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_TRY_FMT, fmt);
     if (ret)
         return AVERROR(EINVAL);
+    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
+        if (fmt->fmt.pix_mp.pixelformat != v4l2_fmt)
+            return AVERROR(EINVAL);
+    } else {
+        if (fmt->fmt.pix.pixelformat != v4l2_fmt)
+            return AVERROR(EINVAL);
+    }
 
     return 0;
+}
+
+static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfmt)
+{
+    uint32_t v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2_type(pixfmt,
+                                                          V4L2_TYPE_IS_MULTIPLANAR(ctx->type));
+
+    return v4l2_try_raw_format_v4l2(ctx, pixfmt, v4l2_fmt);
 }
 
 static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
@@ -499,8 +514,10 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
 
     if (pixfmt != AV_PIX_FMT_NONE) {
         ret = v4l2_try_raw_format(ctx, pixfmt);
-        if (!ret)
+        if (!ret) {
+            *p = pixfmt;
             return 0;
+        }
     }
 
     for (;;) {
@@ -509,7 +526,12 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
             return AVERROR(EINVAL);
 
         pixfmt = ff_v4l2_format_v4l2_to_avfmt(fdesc.pixelformat, AV_CODEC_ID_RAWVIDEO);
-        ret = v4l2_try_raw_format(ctx, pixfmt);
+        if (pixfmt == AV_PIX_FMT_NONE) {
+            fdesc.index++;
+            continue;
+        }
+
+        ret = v4l2_try_raw_format_v4l2(ctx, pixfmt, fdesc.pixelformat);
         if (ret){
             fdesc.index++;
             continue;

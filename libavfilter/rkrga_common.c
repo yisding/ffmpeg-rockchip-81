@@ -25,6 +25,7 @@
 
 #include <inttypes.h>
 #include <limits.h>
+#include <string.h>
 
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
@@ -133,6 +134,7 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
 {
     const AVDRMPlaneDescriptor *plane0, *plane1;
     const int is_packed_fmt = is_rgb || (!is_rgb && !is_planar);
+    uint64_t h_stride;
 
     if (!object || !layer || !ws || !hs || width <= 0 || height <= 0)
         return AVERROR(EINVAL);
@@ -140,7 +142,7 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
     plane0 = &layer->planes[0];
     plane1 = &layer->planes[1];
 
-    if (plane0->pitch <= 0)
+    if (plane0->pitch <= 0 || plane0->pitch > INT_MAX)
         return AVERROR(EINVAL);
 
     if (is_packed_fmt) {
@@ -196,16 +198,22 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
             break;
         }
     }
-    *hs = is_packed_fmt ?
-        ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2) :
-        (plane1->offset / plane0->pitch);
+    if (is_packed_fmt) {
+        h_stride = ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2);
+    } else {
+        if (plane1->offset < 0)
+            return AVERROR(EINVAL);
+        h_stride = plane1->offset / plane0->pitch;
+    }
     if (!is_packed_fmt && plane1->offset % plane0->pitch)
         return AVERROR(EINVAL);
 
-    if (*ws <= 0 || *hs <= 0 ||
-        *ws < width || *hs < height)
+    if (*ws <= 0 || !h_stride ||
+        h_stride > INT_MAX ||
+        *ws < width || h_stride < height)
         return AVERROR(EINVAL);
 
+    *hs = h_stride;
     return 0;
 }
 
@@ -343,6 +351,103 @@ static uint32_t get_drm_linear_format(enum AVPixelFormat pix_fmt)
     }
 }
 
+static int get_aligned_linesize(enum AVPixelFormat pix_fmt, int width, int plane)
+{
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(pix_fmt);
+    int is_rgb, is_yuv, is_planar, is_packed_fmt, is_fully_planar;
+    int linesize;
+
+    if (!pixdesc)
+        return AVERROR(EINVAL);
+
+    is_rgb = pixdesc->flags & AV_PIX_FMT_FLAG_RGB;
+    is_yuv = !is_rgb && pixdesc->nb_components >= 2;
+    is_planar = pixdesc->flags & AV_PIX_FMT_FLAG_PLANAR;
+    is_packed_fmt = is_rgb || (!is_rgb && !is_planar);
+    is_fully_planar = is_planar &&
+                      pixdesc->comp[1].plane != pixdesc->comp[2].plane;
+
+    if (pix_fmt == AV_PIX_FMT_NV15 ||
+        pix_fmt == AV_PIX_FMT_NV20_PACKED) {
+        int width_align_256_odds = FFALIGN(width, 256) | 256;
+        return FFALIGN(width_align_256_odds * 10 / 8, 64);
+    }
+    if (pix_fmt == AV_PIX_FMT_P010 ||
+        pix_fmt == AV_PIX_FMT_P210)
+        return FFALIGN(width, 64) * 2;
+    if ((pix_fmt == AV_PIX_FMT_NV24 ||
+         pix_fmt == AV_PIX_FMT_NV42) && plane)
+        return FFALIGN(width, 64) * 2;
+
+    linesize = av_image_get_linesize(pix_fmt, width, plane);
+    if (linesize < 0)
+        return linesize;
+
+    if (is_packed_fmt) {
+        int pixel_width = av_get_padded_bits_per_pixel(pixdesc) / 8;
+
+        if (pixel_width <= 0)
+            return AVERROR(EINVAL);
+        linesize = FFALIGN(linesize / pixel_width, 16) * pixel_width;
+    } else if (is_yuv && is_fully_planar) {
+        linesize = FFALIGN(linesize, 16 >> (plane ? pixdesc->log2_chroma_w : 0));
+    } else {
+        linesize = FFALIGN(linesize, 64);
+    }
+
+    return linesize;
+}
+
+static int reset_linear_drm_desc(AVFilterContext *avctx,
+                                 AVDRMFrameDescriptor *desc,
+                                 enum AVPixelFormat pix_fmt,
+                                 int width, int height)
+{
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(pix_fmt);
+    AVDRMLayerDescriptor *layer;
+    uint32_t drm_fmt = get_drm_linear_format(pix_fmt);
+    int nb_planes = av_pix_fmt_count_planes(pix_fmt);
+
+    if (!desc || !pixdesc || width <= 0 || height <= 0 ||
+        desc->nb_objects < 1 || desc->objects[0].fd < 0 ||
+        desc->objects[0].size == 0 ||
+        drm_fmt == DRM_FORMAT_INVALID ||
+        nb_planes < 1 || nb_planes > AV_DRM_MAX_PLANES) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid output DRM frame descriptor\n");
+        return AVERROR(EINVAL);
+    }
+
+    desc->nb_objects = 1;
+    desc->nb_layers = 1;
+    desc->objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+
+    layer = &desc->layers[0];
+    memset(layer, 0, sizeof(*layer));
+    layer->format = drm_fmt;
+    layer->nb_planes = nb_planes;
+
+    for (int i = 0; i < nb_planes; i++) {
+        int linesize = get_aligned_linesize(pix_fmt, width, i);
+
+        if (linesize < 0)
+            return linesize;
+
+        layer->planes[i].object_index = 0;
+        layer->planes[i].pitch = linesize;
+        if (!i) {
+            layer->planes[i].offset = 0;
+        } else {
+            const AVDRMPlaneDescriptor *prev = &layer->planes[i - 1];
+            int plane_height = FFALIGN(height, 2) >>
+                               (i > 1 ? pixdesc->log2_chroma_h : 0);
+
+            layer->planes[i].offset = prev->offset + prev->pitch * plane_height;
+        }
+    }
+
+    return 0;
+}
+
 static int is_pixel_stride_rga3_compat(int ws, int hs,
                                        enum _Rga_SURF_FORMAT fmt)
 {
@@ -391,7 +496,7 @@ static int rga3_core_can_be_used(const RKRGAContext *r, int scheduler_core)
 static void select_rga2_core(RKRGAContext *r, RGAFrameInfo *out)
 {
     r->is_rga2_used = 1;
-    if (out) {
+    if (out && (r->has_rga3 || r->has_rga2p)) {
         out->scheduler_core = 0x4;
         if (r->has_rga2p)
             out->scheduler_core |= 0x8;
@@ -547,6 +652,36 @@ static int validate_drm_desc_shape(AVFilterContext *avctx,
     return 0;
 }
 
+static int get_expected_chroma_pitch(enum AVPixelFormat pix_fmt,
+                                     const AVPixFmtDescriptor *pix_desc,
+                                     ptrdiff_t luma_pitch,
+                                     ptrdiff_t *expected_pitch)
+{
+    int is_fully_planar;
+
+    if (!pix_desc || !expected_pitch || luma_pitch <= 0)
+        return AVERROR(EINVAL);
+
+    is_fully_planar = (pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
+                      pix_desc->nb_components >= 3 &&
+                      pix_desc->comp[1].plane != pix_desc->comp[2].plane;
+
+    if (is_fully_planar) {
+        if (luma_pitch % (1 << pix_desc->log2_chroma_w))
+            return AVERROR(EINVAL);
+        *expected_pitch = luma_pitch >> pix_desc->log2_chroma_w;
+    } else if (pix_fmt == AV_PIX_FMT_NV24 ||
+               pix_fmt == AV_PIX_FMT_NV42) {
+        if (luma_pitch > INT_MAX / 2)
+            return AVERROR(EINVAL);
+        *expected_pitch = luma_pitch * 2;
+    } else {
+        *expected_pitch = luma_pitch;
+    }
+
+    return 0;
+}
+
 static int validate_linear_drm_layer(AVFilterContext *avctx,
                                      const AVDRMObjectDescriptor *object,
                                      const AVDRMLayerDescriptor *layer,
@@ -559,6 +694,7 @@ static int validate_linear_drm_layer(AVFilterContext *avctx,
     size_t expected_offset = 0;
     int nb_planes = av_pix_fmt_count_planes(pix_fmt);
     int layout_height, ret;
+    int64_t layout_height64;
 
     if (!object || width <= 0 || height <= 0 ||
         drm_fmt == DRM_FORMAT_INVALID ||
@@ -580,7 +716,8 @@ static int validate_linear_drm_layer(AVFilterContext *avctx,
         const AVDRMPlaneDescriptor *plane = &layer->planes[i];
         int min_linesize;
 
-        if (plane->object_index < 0 || plane->offset < 0 || plane->pitch <= 0) {
+        if (plane->object_index < 0 || plane->offset < 0 ||
+            plane->pitch <= 0 || plane->pitch > INT_MAX) {
             av_log(avctx, AV_LOG_ERROR, "Invalid DRM plane %d descriptor\n", i);
             return AVERROR(EINVAL);
         }
@@ -604,17 +741,37 @@ static int validate_linear_drm_layer(AVFilterContext *avctx,
 
     layout_height = height;
     if (nb_planes > 1) {
+        const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(pix_fmt);
+
         if (layer->planes[1].offset % layer->planes[0].pitch) {
             av_log(avctx, AV_LOG_ERROR,
                    "DRM chroma plane offset is not aligned to luma pitch\n");
             return AVERROR(EINVAL);
         }
-        layout_height = layer->planes[1].offset / layer->planes[0].pitch;
-        if (layout_height < height) {
+        layout_height64 = layer->planes[1].offset / layer->planes[0].pitch;
+        if (layout_height64 < height || layout_height64 > INT_MAX) {
             av_log(avctx, AV_LOG_ERROR,
-                   "DRM luma stride height %d is smaller than frame height %d\n",
-                   layout_height, height);
+                   "DRM luma stride height %"PRId64" is outside valid range for frame height %d\n",
+                   layout_height64, height);
             return AVERROR(EINVAL);
+        }
+        layout_height = layout_height64;
+
+        for (int i = 1; i < nb_planes; i++) {
+            ptrdiff_t expected_pitch;
+
+            ret = get_expected_chroma_pitch(pix_fmt, pix_desc,
+                                            layer->planes[0].pitch,
+                                            &expected_pitch);
+            if (ret < 0)
+                return ret;
+
+            if (layer->planes[i].pitch != expected_pitch) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "DRM plane %d pitch %td is not representable by RGA stride %td\n",
+                       i, layer->planes[i].pitch, layer->planes[0].pitch);
+                return AVERROR(ENOSYS);
+            }
         }
     }
 
@@ -852,6 +1009,12 @@ static int verify_rga_frame_info_io_dynamic(AVFilterContext *avctx,
     if (!in || !out)
         return AVERROR(EINVAL);
 
+    if (out->pix_fmt == AV_PIX_FMT_NV15 ||
+        out->pix_fmt == AV_PIX_FMT_NV20_PACKED) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' as output is not supported\n",
+               av_get_pix_fmt_name(out->pix_fmt));
+        return AVERROR(ENOSYS);
+    }
     if (r->is_rga2_used && !r->has_rga2) {
         av_log(avctx, AV_LOG_ERROR, "RGA2 is requested but not available\n");
         return AVERROR(ENOSYS);
@@ -870,11 +1033,9 @@ static int verify_rga_frame_info_io_dynamic(AVFilterContext *avctx,
                av_get_pix_fmt_name(AV_PIX_FMT_P210));
         return AVERROR(ENOSYS);
     }
-    if (r->is_rga2_used &&
-        (out->pix_fmt == AV_PIX_FMT_NV15 ||
-         out->pix_fmt == AV_PIX_FMT_NV20_PACKED)) {
-        av_log(avctx, AV_LOG_ERROR, "'%s' as output is not supported if RGA2 is requested\n",
-               av_get_pix_fmt_name(out->pix_fmt));
+    if (r->is_rga2_used && is_rga3_only_input_format(in->pix_fmt)) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' input is not supported if RGA2 is requested\n",
+               av_get_pix_fmt_name(in->pix_fmt));
         return AVERROR(ENOSYS);
     }
     if (!r->has_rga2p && r->is_rga2_used && in->crop && in->pix_desc->comp[0].depth >= 10) {
@@ -1084,10 +1245,12 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     RGAFrameInfo *in0_info = &r->in_rga_frame_infos[0];
     RGAFrameInfo *in1_info = ctx->nb_inputs > 1 ? &r->in_rga_frame_infos[1] : NULL;
     RGAFrameInfo *out_info = pat_preproc ? in1_info : &r->out_rga_frame_info;
+    RGAFrameInfo validate_in_info, validate_out_info;
     AVBufferRef *hw_frame_ctx = pat_preproc ? r->pat_preproc_hwframes_ctx :
                                               ff_filter_link(outlink)->hw_frames_ctx;
     int w_stride = 0, h_stride = 0;
     int act_w, act_h;
+    int frame_w, frame_h;
     AVDRMFrameDescriptor *desc;
     AVDRMLayerDescriptor *layer;
     AVDRMObjectDescriptor *object;
@@ -1097,9 +1260,19 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     if (!out_info || !hw_frame_ctx)
         return NULL;
 
+    validate_in_info = pat_preproc ? *in1_info : *in0_info;
+    validate_out_info = *out_info;
     if (pat_preproc) {
         act_w = FFMIN(in0_info->act_w - in1_info->overlay_x, in1_info->act_w);
         act_h = FFMIN(in0_info->act_h - in1_info->overlay_y, in1_info->act_h);
+        validate_in_info.act_x = 0;
+        validate_in_info.act_y = 0;
+        validate_in_info.act_w = act_w;
+        validate_in_info.act_h = act_h;
+        validate_out_info.act_x = in1_info->overlay_x;
+        validate_out_info.act_y = in1_info->overlay_y;
+        validate_out_info.act_w = act_w;
+        validate_out_info.act_h = act_h;
     } else {
         act_w = out_info->act_w;
         act_h = out_info->act_h;
@@ -1145,7 +1318,12 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         goto fail;
     }
 
+    frame_w = out_frame->frame->width;
+    frame_h = out_frame->frame->height;
     desc = (AVDRMFrameDescriptor *)out_frame->frame->data[0];
+    ret = reset_linear_drm_desc(ctx, desc, out_info->pix_fmt, frame_w, frame_h);
+    if (ret < 0)
+        goto fail;
     ret = validate_drm_desc_shape(ctx, desc);
     if (ret < 0)
         goto fail;
@@ -1196,7 +1374,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     }
 
     ret = validate_linear_drm_layer(ctx, object, layer, out_info->pix_fmt,
-                                    outlink->w, outlink->h);
+                                    frame_w, frame_h);
     if (ret < 0)
         goto fail;
     if (!is_afbc) {
@@ -1205,18 +1383,18 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                out_info->pix_fmt,
                                (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
                                (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               outlink->w, outlink->h, &w_stride, &h_stride);
+                               frame_w, frame_h, &w_stride, &h_stride);
         if (ret < 0 || !w_stride || !h_stride) {
             av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
             goto fail;
         }
     }
 
-    ret = validate_active_rect_stride(ctx, out_info,
+    ret = validate_active_rect_stride(ctx, &validate_out_info,
                                       w_stride, h_stride, "Output");
     if (ret < 0)
         goto fail;
-    ret = validate_rga3_pixel_stride(ctx, out_info, &r->out_rga_frame_info,
+    ret = validate_rga3_pixel_stride(ctx, &validate_out_info, out_info,
                                      w_stride, h_stride, "Output");
     if (ret < 0)
         goto fail;
@@ -1227,23 +1405,23 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                out_info->pix_fmt,
                                (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
                                (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               outlink->w, outlink->h, &w_stride, &h_stride);
+                               frame_w, frame_h, &w_stride, &h_stride);
         if (ret < 0 || !w_stride || !h_stride) {
             av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
             goto fail;
         }
-        ret = validate_active_rect_stride(ctx, out_info,
+        ret = validate_active_rect_stride(ctx, &validate_out_info,
                                           w_stride, h_stride, "Output");
         if (ret < 0)
             goto fail;
-        ret = validate_rga3_pixel_stride(ctx, out_info, &r->out_rga_frame_info,
+        ret = validate_rga3_pixel_stride(ctx, &validate_out_info, out_info,
                                          w_stride, h_stride, "Output");
         if (ret < 0)
             goto fail;
     }
     if ((ret = verify_rga_frame_info_io_dynamic(ctx,
-                                                pat_preproc ? in1_info : in0_info,
-                                                out_info)) < 0)
+                                                pat_preproc ? &validate_in_info : in0_info,
+                                                &validate_out_info)) < 0)
         goto fail;
 
     info.fd           = object->fd;
@@ -1465,6 +1643,13 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
     if (!src || !dst)
         return AVERROR(EINVAL);
 
+    if (dst->pix_fmt == AV_PIX_FMT_NV15 ||
+        dst->pix_fmt == AV_PIX_FMT_NV20_PACKED) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' as output is not supported\n",
+               av_get_pix_fmt_name(dst->pix_fmt));
+        return AVERROR(ENOSYS);
+    }
+
     scale_ratio_w = (float)dst->act_w / (float)src->act_w;
     scale_ratio_h = (float)dst->act_h / (float)src->act_h;
 
@@ -1587,6 +1772,11 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
     }
 
     r->is_rga2_used = r->is_rga2_used || !r->has_rga3;
+    if (r->is_rga2_used && is_rga3_only_input_format(src->pix_fmt)) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' input is not supported if RGA2 is requested\n",
+               av_get_pix_fmt_name(src->pix_fmt));
+        return AVERROR(ENOSYS);
+    }
     if (pat && r->is_rga2_used && is_rga3_only_input_format(pat->pix_fmt)) {
         av_log(avctx, AV_LOG_ERROR, "'%s' overlay input is not supported if RGA2 is requested\n",
                av_get_pix_fmt_name(pat->pix_fmt));
@@ -1601,6 +1791,7 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         }
         if (src->act_w < 68 ||
             src->act_w > 8176 ||
+            src->act_h < 2 ||
             src->act_h > 8176 ||
             dst->act_w < 68 ||
             dst->act_w > 8128 ||
@@ -1609,19 +1800,28 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         }
         if (pat && (pat->act_w < 68 ||
              pat->act_w > 8176 ||
+             pat->act_h < 2 ||
              pat->act_h > 8176)) {
             r->is_rga2_used = 1;
         }
+    }
+    if (pat && r->is_rga2_used && is_rga3_only_input_format(pat->pix_fmt)) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' overlay input is not supported if RGA2 is requested\n",
+               av_get_pix_fmt_name(pat->pix_fmt));
+        return AVERROR(ENOSYS);
     }
 
     if ((ret = verify_rga_frame_info_io_dynamic(avctx, src, dst)) < 0)
         return ret;
 
     if (r->is_rga2_used) {
-        if (!is_rga2_core_mask(r->scheduler_core)) {
+        if (!is_rga2_core_mask(r->scheduler_core) &&
+            (r->has_rga3 || r->has_rga2p)) {
             r->scheduler_core = 0x4;
             if (r->has_rga2p)
                 r->scheduler_core |= 0x8;
+        } else if (!(r->has_rga3 || r->has_rga2p)) {
+            r->scheduler_core = 0;
         }
     }
 
@@ -1700,6 +1900,8 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
 av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
 {
     RKRGAContext *r = avctx->priv;
+    RGAFrameInfo clipped_pat_info;
+    RGAFrameInfo *pat_info_for_verify = NULL;
     int i, ret;
     int rga_core_mask = 0x7;
     const char *rga_ver = querystring(RGA_VERSION);
@@ -1723,6 +1925,11 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     /* RGA core */
     if (r->scheduler_core && !(r->has_rga2 && r->has_rga3) && !r->has_rga2p) {
         av_log(avctx, AV_LOG_WARNING, "Scheduler core cannot be set on non-multicore RGA hw, ignoring\n");
+        r->scheduler_core = 0;
+    }
+    if (r->scheduler_core &&
+        is_rga3_core_mask(r->scheduler_core) && !r->has_rga3) {
+        av_log(avctx, AV_LOG_WARNING, "Invalid scheduler core set, ignoring\n");
         r->scheduler_core = 0;
     }
     if (r->scheduler_core && r->scheduler_core != (r->scheduler_core & rga_core_mask)) {
@@ -1782,6 +1989,8 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     if (avctx->nb_inputs > 1) {
         int need_premultiply = 0;
 
+        pat_info_for_verify = &r->in_rga_frame_infos[1];
+
         if (r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
             need_premultiply = param->in_alpha_format == 0;
 
@@ -1804,8 +2013,8 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
 
         r->is_overlay_offset_valid = (param->overlay_x >= 0) &&
             (param->overlay_y >= 0) &&
-            (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
-            (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2);
+            (param->overlay_x <= r->in_rga_frame_infos[0].act_w - 2) &&
+            (param->overlay_y <= r->in_rga_frame_infos[0].act_h - 2);
         if (r->is_overlay_offset_valid) {
             ret = init_pat_preproc_hwframes_ctx(avctx);
             if (ret < 0)
@@ -1834,12 +2043,16 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
             ret = AVERROR(EINVAL);
             goto fail;
         }
+
+        clipped_pat_info = *in1_info;
+        clipped_pat_info.act_w = overlay_w;
+        clipped_pat_info.act_h = overlay_h;
+        pat_info_for_verify = &clipped_pat_info;
     }
 
     /* Pre-check RGAFrameInfo */
     ret = verify_rga_frame_info(avctx, &r->in_rga_frame_infos[0],
-                                &r->out_rga_frame_info,
-                                (avctx->nb_inputs > 1 ? &r->in_rga_frame_infos[1] : NULL));
+                                &r->out_rga_frame_info, pat_info_for_verify);
     if (ret < 0)
         goto fail;
 
