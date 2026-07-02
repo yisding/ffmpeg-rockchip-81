@@ -300,9 +300,11 @@ static int rgaoverlay_activate(AVFilterContext *ctx)
     return 0;
 
 eof:
-    ff_rkrga_filter_frame(&r->rga,
-                          inlink_main, NULL,
-                          inlink_overlay, NULL);
+    ret = ff_rkrga_filter_frame(&r->rga,
+                                inlink_main, NULL,
+                                inlink_overlay, NULL);
+    if (ret < 0)
+        return ret;
 
     pts = av_rescale_q(pts, inlink_main->time_base, outlink->time_base);
     ff_outlink_set_status(outlink, AVERROR_EOF, pts);

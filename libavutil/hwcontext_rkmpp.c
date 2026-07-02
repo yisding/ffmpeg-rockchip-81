@@ -217,6 +217,7 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
 
     MppBuffer mpp_buf = NULL;
     size_t mpp_buf_size = (size_t)aligned_w * aligned_h * bits_pp / 8;
+    size_t layout_size;
 
     if (hwfc->initial_pool_size > 0 &&
         avfc->nb_frames >= hwfc->initial_pool_size)
@@ -228,17 +229,6 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
 
     desc->drm_desc.nb_objects = 1;
     desc->drm_desc.nb_layers  = 1;
-
-    ret = mpp_buffer_get(avfc->buf_group, &mpp_buf, mpp_buf_size);
-    if (ret != MPP_OK || !mpp_buf) {
-        av_log(hwfc, AV_LOG_ERROR, "Failed to get MPP buffer: %d\n", ret);
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-    desc->buffers[0] = mpp_buf;
-
-    desc->drm_desc.objects[0].fd   = mpp_buffer_get_fd(mpp_buf);
-    desc->drm_desc.objects[0].size = mpp_buffer_get_size(mpp_buf);
 
     layer = &desc->drm_desc.layers[0];
     for (i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++) {
@@ -261,6 +251,25 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
         layer->planes[i].pitch =
             rkmpp_get_aligned_linesize(hwfc->sw_format, hwfc->width, i);
     }
+
+    /* the buffer must cover the layout exported above: special pitches
+     * (e.g. NV15/NV20) can exceed the generic size estimate */
+    i = layer->nb_planes - 1;
+    layout_size = layer->planes[i].offset +
+                  (size_t)layer->planes[i].pitch *
+                  (FFALIGN(hwfc->height, 2) >> (i > 0 ? pixdesc->log2_chroma_h : 0));
+    mpp_buf_size = FFMAX(mpp_buf_size, layout_size);
+
+    ret = mpp_buffer_get(avfc->buf_group, &mpp_buf, mpp_buf_size);
+    if (ret != MPP_OK || !mpp_buf) {
+        av_log(hwfc, AV_LOG_ERROR, "Failed to get MPP buffer: %d\n", ret);
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    desc->buffers[0] = mpp_buf;
+
+    desc->drm_desc.objects[0].fd   = mpp_buffer_get_fd(mpp_buf);
+    desc->drm_desc.objects[0].size = mpp_buffer_get_size(mpp_buf);
 
     ref = av_buffer_create((uint8_t*)desc, sizeof(*desc), rkmpp_free_drm_frame_descriptor,
                            mpp_buf, 0);
