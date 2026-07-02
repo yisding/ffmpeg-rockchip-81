@@ -21,6 +21,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <limits.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -29,6 +30,7 @@
 #include <poll.h>
 #include "libavcodec/avcodec.h"
 #include "libavutil/attributes.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/refstruct.h"
 #include "v4l2_context.h"
@@ -319,6 +321,86 @@ static int v4l2_bufref_to_buf(V4L2Buffer *out, int plane, const uint8_t* data, i
     return 0;
 }
 
+static int v4l2_copy_plane_to_buf_at(V4L2Buffer *out, int plane,
+                                      const uint8_t *data, int src_linesize,
+                                      int row_bytes, int dst_linesize,
+                                      int rows, int offset)
+{
+    uint8_t *dst;
+    uint64_t size, end;
+    unsigned int bytesused, length;
+
+    if (plane >= out->num_planes || !data ||
+        src_linesize < row_bytes || dst_linesize < row_bytes ||
+        rows <= 0 || row_bytes <= 0 || offset < 0)
+        return AVERROR(EINVAL);
+
+    size = (uint64_t)dst_linesize * rows;
+    end = size + offset;
+    if (end > out->plane_info[plane].length || end > UINT_MAX ||
+        out->plane_info[plane].length > UINT_MAX)
+        return AVERROR(EINVAL);
+
+    dst = (uint8_t*)out->plane_info[plane].mm_addr + offset;
+    for (int row = 0; row < rows; row++) {
+        memcpy(dst, data, row_bytes);
+        dst  += dst_linesize;
+        data += src_linesize;
+    }
+
+    bytesused = end;
+    length = out->plane_info[plane].length;
+    if (V4L2_TYPE_IS_MULTIPLANAR(out->buf.type)) {
+        out->planes[plane].bytesused = bytesused;
+        out->planes[plane].length = length;
+    } else {
+        out->buf.bytesused = bytesused;
+        out->buf.length = length;
+    }
+    return 0;
+}
+
+static int v4l2_copy_plane_to_buf(V4L2Buffer *out, int plane,
+                                  const uint8_t *data, int src_linesize,
+                                  int row_bytes, int rows)
+{
+    int dst_linesize;
+
+    if (plane >= out->num_planes)
+        return AVERROR(EINVAL);
+
+    dst_linesize = out->plane_info[plane].bytesperline;
+    return v4l2_copy_plane_to_buf_at(out, plane, data, src_linesize,
+                                     row_bytes, dst_linesize, rows, 0);
+}
+
+static int v4l2_single_buffer_plane_linesize(enum AVPixelFormat pix_fmt,
+                                             const AVPixFmtDescriptor *desc,
+                                             int base_linesize, int plane,
+                                             int *linesize)
+{
+    if (plane > 0) {
+        int fully_planar = (desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
+                           desc->nb_components >= 3 &&
+                           desc->comp[1].plane != desc->comp[2].plane;
+
+        if (fully_planar) {
+            int div = 1 << desc->log2_chroma_w;
+            if (base_linesize % div)
+                return AVERROR(EINVAL);
+            base_linesize >>= desc->log2_chroma_w;
+        } else if (pix_fmt == AV_PIX_FMT_NV24 ||
+                   pix_fmt == AV_PIX_FMT_NV42) {
+            if (base_linesize > INT_MAX / 2)
+                return AVERROR(EINVAL);
+            base_linesize *= 2;
+        }
+    }
+
+    *linesize = base_linesize;
+    return 0;
+}
+
 static int v4l2_buffer_buf_to_swframe(AVFrame *frame, V4L2Buffer *avbuf)
 {
     int i, ret;
@@ -338,9 +420,21 @@ static int v4l2_buffer_buf_to_swframe(AVFrame *frame, V4L2Buffer *avbuf)
     switch (avbuf->context->av_pix_fmt) {
     case AV_PIX_FMT_NV12:
     case AV_PIX_FMT_NV21:
+    case AV_PIX_FMT_NV15:
+    case AV_PIX_FMT_NV16:
+    case AV_PIX_FMT_NV20_PACKED:
         if (avbuf->num_planes > 1)
             break;
         frame->linesize[1] = avbuf->plane_info[0].bytesperline;
+        frame->data[1] = frame->buf[0]->data + avbuf->plane_info[0].bytesperline * avbuf->context->format.fmt.pix_mp.height;
+        break;
+
+    case AV_PIX_FMT_NV24:
+        if (avbuf->num_planes > 1)
+            break;
+        if (avbuf->plane_info[0].bytesperline > INT_MAX / 2)
+            return AVERROR(EINVAL);
+        frame->linesize[1] = avbuf->plane_info[0].bytesperline * 2;
         frame->data[1] = frame->buf[0]->data + avbuf->plane_info[0].bytesperline * avbuf->context->format.fmt.pix_mp.height;
         break;
 
@@ -396,19 +490,47 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 
     if (!is_planar_format) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+        int row_bytes[4] = { 0 };
         int planes_nb = 0;
         int offset = 0;
+
+        if (!desc)
+            return AVERROR(EINVAL);
+        if (out->num_planes != 1)
+            return AVERROR(EINVAL);
 
         for (i = 0; i < desc->nb_components; i++)
             planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
 
+        ret = av_image_fill_linesizes(row_bytes, frame->format,
+                                      frame->width);
+        if (ret)
+            return ret;
+
         for (i = 0; i < planes_nb; i++) {
-            int size, h = height;
+            int dst_linesize, h = height;
+            int64_t size;
+
             if (i == 1 || i == 2) {
                 h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
             }
-            size = frame->linesize[i] * h;
-            ret = v4l2_bufref_to_buf(out, 0, frame->data[i], size, offset);
+
+            ret = v4l2_single_buffer_plane_linesize(frame->format, desc,
+                                                    out->plane_info[0].bytesperline,
+                                                    i, &dst_linesize);
+            if (ret)
+                return ret;
+            size = (int64_t)dst_linesize * h;
+            if (size > INT_MAX - offset)
+                return AVERROR(EINVAL);
+
+            if (!frame->data[i])
+                return AVERROR(EINVAL);
+
+            ret = v4l2_copy_plane_to_buf_at(out, 0, frame->data[i],
+                                            frame->linesize[i],
+                                            row_bytes[i], dst_linesize,
+                                            h, offset);
             if (ret)
                 return ret;
             offset += size;
@@ -416,10 +538,39 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
         return 0;
     }
 
-    for (i = 0; i < out->num_planes; i++) {
-        ret = v4l2_bufref_to_buf(out, i, frame->buf[i]->data, frame->buf[i]->size, 0);
+    {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+        int row_bytes[4] = { 0 };
+        int plane_rows[4] = { 0 };
+        int planes_nb = 0;
+
+        if (!desc)
+            return AVERROR(EINVAL);
+
+        for (i = 0; i < desc->nb_components; i++)
+            planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
+        if (out->num_planes > planes_nb)
+            return AVERROR(EINVAL);
+
+        ret = av_image_fill_linesizes(row_bytes, frame->format,
+                                      frame->width);
         if (ret)
             return ret;
+
+        for (i = 0; i < out->num_planes; i++) {
+            plane_rows[i] = height;
+            if (i == 1 || i == 2)
+                plane_rows[i] = AV_CEIL_RSHIFT(height, desc->log2_chroma_h);
+
+            if (!frame->data[i])
+                return AVERROR(EINVAL);
+
+            ret = v4l2_copy_plane_to_buf(out, i, frame->data[i],
+                                         frame->linesize[i],
+                                         row_bytes[i], plane_rows[i]);
+            if (ret)
+                return ret;
+        }
     }
 
     return 0;
