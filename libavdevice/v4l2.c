@@ -412,7 +412,7 @@ static int mmap_init(AVFormatContext *ctx)
     for (i = 0; i < req.count; i++) {
         int plane_count;
         int total_frame_size = 0;
-        struct v4l2_plane planes[VIDEO_MAX_PLANES];
+        struct v4l2_plane planes[VIDEO_MAX_PLANES] = { 0 };
         struct v4l2_buffer buf = {
             .type   = s->buf_type,
             .index  = i,
@@ -492,7 +492,7 @@ static int enqueue_buffer(struct video_data *s, struct v4l2_buffer *buf)
 
 static void mmap_release_buffer(void *opaque, uint8_t *data)
 {
-    struct v4l2_plane planes[VIDEO_MAX_PLANES];
+    struct v4l2_plane planes[VIDEO_MAX_PLANES] = { 0 };
     struct v4l2_buffer buf = { 0 };
     struct buf_desc *buf_descriptor = opaque;
     struct video_data *s = buf_descriptor->s;
@@ -571,7 +571,7 @@ static int convert_timestamp(AVFormatContext *ctx, int64_t *ts)
 static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
 {
     struct video_data *s = ctx->priv_data;
-    struct v4l2_plane planes[VIDEO_MAX_PLANES];
+    struct v4l2_plane planes[VIDEO_MAX_PLANES] = { 0 };
     struct v4l2_buffer buf = {
         .type   = s->buf_type,
         .memory = V4L2_MEMORY_MMAP,
@@ -737,7 +737,7 @@ static int mmap_start(AVFormatContext *ctx)
     int i, res;
 
     for (i = 0; i < s->buffers; i++) {
-        struct v4l2_plane planes[VIDEO_MAX_PLANES];
+        struct v4l2_plane planes[VIDEO_MAX_PLANES] = { 0 };
         struct v4l2_buffer buf = {
             .type   = s->buf_type,
             .index  = i,
@@ -1001,6 +1001,7 @@ static int v4l2_read_header(AVFormatContext *ctx)
     enum AVCodecID codec_id = AV_CODEC_ID_NONE;
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
     struct v4l2_input input = { 0 };
+    int input_probe_ignored = 0;
 
     st = avformat_new_stream(ctx, NULL);
     if (!st)
@@ -1033,8 +1034,10 @@ static int v4l2_read_header(AVFormatContext *ctx)
             av_log(ctx, (s->ignore_input_error) ? AV_LOG_WARNING : AV_LOG_ERROR, "ioctl(VIDIOC_G_INPUT): %s\n", av_err2str(res));
             if (!s->ignore_input_error)
                 goto fail;
-            else
+            else {
                 s->channel = 0;
+                input_probe_ignored = 1;
+            }
         }
     }
 
@@ -1042,12 +1045,16 @@ static int v4l2_read_header(AVFormatContext *ctx)
     input.index = s->channel;
     if (v4l2_ioctl(s->fd, VIDIOC_ENUMINPUT, &input) < 0) {
         res = AVERROR(errno);
-        av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_ENUMINPUT): %s\n", av_err2str(res));
-        goto fail;
+        av_log(ctx, input_probe_ignored ? AV_LOG_WARNING : AV_LOG_ERROR,
+               "ioctl(VIDIOC_ENUMINPUT): %s\n", av_err2str(res));
+        if (!input_probe_ignored)
+            goto fail;
+        s->std_id = 0;
+    } else {
+        s->std_id = input.std;
+        av_log(ctx, AV_LOG_DEBUG, "Current input_channel: %d, input_name: %s, input_std: %"PRIx64"\n",
+               s->channel, input.name, (uint64_t)input.std);
     }
-    s->std_id = input.std;
-    av_log(ctx, AV_LOG_DEBUG, "Current input_channel: %d, input_name: %s, input_std: %"PRIx64"\n",
-           s->channel, input.name, (uint64_t)input.std);
 
     if (s->list_format) {
         list_formats(ctx, s->list_format);
