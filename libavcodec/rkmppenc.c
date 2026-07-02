@@ -26,6 +26,7 @@
 
 #include "config_components.h"
 #include "encode.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "rkmppenc.h"
 
@@ -297,6 +298,67 @@ static int rkmpp_check_drm_layer_format(AVCodecContext *avctx,
     return 0;
 }
 
+static int rkmpp_check_linear_drm_layout(AVCodecContext *avctx,
+                                         const AVDRMFrameDescriptor *desc,
+                                         enum AVPixelFormat pix_fmt,
+                                         int height)
+{
+    const AVDRMObjectDescriptor *object;
+    const AVDRMLayerDescriptor *layer;
+    ptrdiff_t linesizes[4] = { 0 };
+    size_t plane_sizes[4] = { 0 };
+    int nb_planes, ret;
+
+    if (!desc || desc->nb_objects != 1 || desc->nb_layers != 1) {
+        av_log(avctx, AV_LOG_ERROR, "DRM input must contain exactly one object and one layer\n");
+        return AVERROR(EINVAL);
+    }
+
+    object = &desc->objects[0];
+    layer = &desc->layers[0];
+    nb_planes = av_pix_fmt_count_planes(pix_fmt);
+    if (nb_planes < 1 || nb_planes > AV_DRM_MAX_PLANES ||
+        layer->nb_planes != nb_planes) {
+        av_log(avctx, AV_LOG_ERROR,
+               "DRM plane count %d does not match pixel format '%s' (%d)\n",
+               layer->nb_planes, av_get_pix_fmt_name(pix_fmt), nb_planes);
+        return AVERROR(EINVAL);
+    }
+
+    ret = rkmpp_check_drm_layer_format(avctx, layer, pix_fmt);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < nb_planes; i++) {
+        const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+
+        if (plane->object_index != 0 ||
+            plane->offset < 0 ||
+            plane->pitch <= 0) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid DRM plane %d descriptor\n", i);
+            return AVERROR(EINVAL);
+        }
+        linesizes[i] = plane->pitch;
+    }
+
+    ret = av_image_fill_plane_sizes(plane_sizes, pix_fmt, height, linesizes);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < nb_planes; i++) {
+        const AVDRMPlaneDescriptor *plane = &layer->planes[i];
+
+        if ((size_t)plane->offset > object->size ||
+            plane_sizes[i] > object->size - (size_t)plane->offset) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "DRM plane %d extends past object size\n", i);
+            return AVERROR(EINVAL);
+        }
+    }
+
+    return 0;
+}
+
 static unsigned get_sent_frame_count(MPPEncFrame *list)
 {
     unsigned count = 0;
@@ -462,7 +524,7 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR(ENOSYS);
     }
     if (!is_fbc) {
-        ret = rkmpp_check_drm_layer_format(avctx, &drm_desc->layers[0], r->pix_fmt);
+        ret = rkmpp_check_linear_drm_layout(avctx, drm_desc, r->pix_fmt, avctx->height);
         if (ret < 0)
             return ret;
 
@@ -1027,7 +1089,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
             mpp_frame_set_offset_y(mpp_frame, afbc_offset_y);
         }
     } else {
-        ret = rkmpp_check_drm_layer_format(avctx, layer, r->pix_fmt);
+        ret = rkmpp_check_linear_drm_layout(avctx, drm_desc, r->pix_fmt, drm_frame->height);
         if (ret < 0) {
             *errp = ret;
             goto exit;
