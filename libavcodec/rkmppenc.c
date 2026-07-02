@@ -117,6 +117,45 @@ static uint32_t rkmpp_get_drm_afbc_format(MppFrameFormat mpp_fmt)
     }
 }
 
+static uint32_t rkmpp_get_drm_format(enum AVPixelFormat pix_fmt)
+{
+    switch (pix_fmt) {
+    case AV_PIX_FMT_GRAY8:     return DRM_FORMAT_R8;
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:  return DRM_FORMAT_YUV420;
+    case AV_PIX_FMT_YUV422P:
+    case AV_PIX_FMT_YUVJ422P:  return DRM_FORMAT_YUV422;
+    case AV_PIX_FMT_YUV444P:
+    case AV_PIX_FMT_YUVJ444P:  return DRM_FORMAT_YUV444;
+    case AV_PIX_FMT_NV12:      return DRM_FORMAT_NV12;
+    case AV_PIX_FMT_NV21:      return DRM_FORMAT_NV21;
+    case AV_PIX_FMT_NV16:      return DRM_FORMAT_NV16;
+    case AV_PIX_FMT_NV24:      return DRM_FORMAT_NV24;
+    case AV_PIX_FMT_YUYV422:   return DRM_FORMAT_YUYV;
+    case AV_PIX_FMT_YVYU422:   return DRM_FORMAT_YVYU;
+    case AV_PIX_FMT_UYVY422:   return DRM_FORMAT_UYVY;
+    case AV_PIX_FMT_RGB444BE:  return DRM_FORMAT_XRGB4444    | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_BGR444BE:  return DRM_FORMAT_XBGR4444    | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_RGB555BE:  return DRM_FORMAT_XRGB1555    | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_BGR555BE:  return DRM_FORMAT_XBGR1555    | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_RGB565BE:  return DRM_FORMAT_RGB565      | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_BGR565BE:  return DRM_FORMAT_BGR565      | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_RGB24:     return DRM_FORMAT_RGB888;
+    case AV_PIX_FMT_BGR24:     return DRM_FORMAT_BGR888;
+    case AV_PIX_FMT_RGBA:      return DRM_FORMAT_ABGR8888;
+    case AV_PIX_FMT_RGB0:      return DRM_FORMAT_XBGR8888;
+    case AV_PIX_FMT_BGRA:      return DRM_FORMAT_ARGB8888;
+    case AV_PIX_FMT_BGR0:      return DRM_FORMAT_XRGB8888;
+    case AV_PIX_FMT_ARGB:      return DRM_FORMAT_BGRA8888;
+    case AV_PIX_FMT_0RGB:      return DRM_FORMAT_BGRX8888;
+    case AV_PIX_FMT_ABGR:      return DRM_FORMAT_RGBA8888;
+    case AV_PIX_FMT_0BGR:      return DRM_FORMAT_RGBX8888;
+    case AV_PIX_FMT_X2RGB10BE: return DRM_FORMAT_XRGB2101010 | DRM_FORMAT_BIG_ENDIAN;
+    case AV_PIX_FMT_X2BGR10BE: return DRM_FORMAT_XBGR2101010 | DRM_FORMAT_BIG_ENDIAN;
+    default:                   return DRM_FORMAT_INVALID;
+    }
+}
+
 static MppFrameChromaFormat rkmpp_fix_chroma_fmt(int chroma_fmt,
                                                  enum AVPixelFormat pix_fmt)
 {
@@ -231,6 +270,28 @@ static int rkmpp_check_drm_object0(AVCodecContext *avctx,
                 return AVERROR(ENOSYS);
             }
         }
+    }
+
+    return 0;
+}
+
+static int rkmpp_check_drm_layer_format(AVCodecContext *avctx,
+                                        const AVDRMLayerDescriptor *layer,
+                                        enum AVPixelFormat pix_fmt)
+{
+    uint32_t drm_fmt = rkmpp_get_drm_format(pix_fmt);
+
+    if (drm_fmt == DRM_FORMAT_INVALID) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported DRM format for pixel format '%s'\n",
+               av_get_pix_fmt_name(pix_fmt));
+        return AVERROR(ENOSYS);
+    }
+
+    if (!layer || layer->format != drm_fmt) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Input DRM format 0x%08"PRIx32" does not match pixel format '%s' (expected 0x%08"PRIx32")\n",
+               layer ? layer->format : 0, av_get_pix_fmt_name(pix_fmt), drm_fmt);
+        return AVERROR(EINVAL);
     }
 
     return 0;
@@ -401,6 +462,10 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR(ENOSYS);
     }
     if (!is_fbc) {
+        ret = rkmpp_check_drm_layer_format(avctx, &drm_desc->layers[0], r->pix_fmt);
+        if (ret < 0)
+            return ret;
+
         ret = get_byte_stride(&drm_desc->objects[0],
                               &drm_desc->layers[0],
                               (pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
@@ -960,6 +1025,12 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
         if (!is_rfbc && rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
             afbc_offset_y = rkmpp_desc->afbc_offset_y;
             mpp_frame_set_offset_y(mpp_frame, afbc_offset_y);
+        }
+    } else {
+        ret = rkmpp_check_drm_layer_format(avctx, layer, r->pix_fmt);
+        if (ret < 0) {
+            *errp = ret;
+            goto exit;
         }
     }
     mpp_frame_set_fmt(mpp_frame, mpp_fmt);

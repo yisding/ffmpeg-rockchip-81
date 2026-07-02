@@ -64,6 +64,14 @@
 #ifndef AFBC_FORMAT_MOD_SPARSE
 #define AFBC_FORMAT_MOD_SPARSE             (1ULL << 6)
 #endif
+#ifndef DRM_FORMAT_MOD_ARM_CODE
+#define DRM_FORMAT_MOD_ARM_CODE(__type, __val) \
+        fourcc_mod_code(ARM, ((__u64)(__type) << 52) | ((__val) & 0x000fffffffffffffULL))
+#endif
+#ifndef DRM_FORMAT_MOD_ARM_AFBC
+#define DRM_FORMAT_MOD_ARM_AFBC(__afbc_mode) \
+        DRM_FORMAT_MOD_ARM_CODE(DRM_FORMAT_MOD_ARM_TYPE_AFBC, __afbc_mode)
+#endif
 
 #define drm_is_afbc(mod) \
         (((mod) >> 52) == (DRM_FORMAT_MOD_ARM_TYPE_AFBC | \
