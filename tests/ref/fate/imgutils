@@ -561,5 +561,5 @@ gbrp10msbbe     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_cr
 gbrp10msble     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_crc: 0x00000000,  black_pc_crc: 0x00000000
 gbrp12msbbe     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_crc: 0x00000000,  black_pc_crc: 0x00000000
 gbrp12msble     total_size:  18432,  black_unknown_crc: 0x00000000,  black_tv_crc: 0x00000000,  black_pc_crc: 0x00000000
-nv15            total_size:   5760,  black_unknown_crc: 0x6b5fdb58,  black_tv_crc: 0x6b5fdb58,  black_pc_crc: 0x660a512c
-nv20_packed     total_size:   7680,  black_unknown_crc: 0x171f53da,  black_tv_crc: 0x171f53da,  black_pc_crc: 0xfcf5cda3
+nv15            total_size:   5760,  black_unknown_crc: 0x3cb4b484,  black_tv_crc: 0x3cb4b484,  black_pc_crc: 0xd8e45b0b
+nv20_packed     total_size:   7680,  black_unknown_crc: 0x29197bd4,  black_tv_crc: 0x29197bd4,  black_pc_crc: 0xfe6e9eee

@@ -152,6 +152,11 @@ FATE_LIBAVUTIL-$(CONFIG_PIXELUTILS) += fate-pixelutils
 fate-pixelutils: libavutil/tests/pixelutils$(EXESUF)
 fate-pixelutils: CMD = run libavutil/tests/pixelutils$(EXESUF)
 
+FATE_LIBAVUTIL += fate-pixdesc
+fate-pixdesc: libavutil/tests/pixdesc$(EXESUF)
+fate-pixdesc: CMD = run libavutil/tests/pixdesc$(EXESUF)
+fate-pixdesc: CMP = null
+
 FATE_LIBAVUTIL += fate-pixfmt_best
 fate-pixfmt_best: libavutil/tests/pixfmt_best$(EXESUF)
 fate-pixfmt_best: CMD = run libavutil/tests/pixfmt_best$(EXESUF)
