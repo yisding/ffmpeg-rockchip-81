@@ -100,6 +100,8 @@ struct video_data {
 
     int multiplanar;
     enum v4l2_buf_type buf_type;
+    int has_capture;
+    int has_capture_mplane;
 
     int buffers;
     int plane_count;
@@ -131,6 +133,41 @@ struct buff_data {
     struct video_data *s;
     int index;
 };
+
+static void select_capture_type(struct video_data *s, int multiplanar)
+{
+    s->multiplanar = multiplanar;
+    s->buf_type = multiplanar ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+                                V4L2_BUF_TYPE_VIDEO_CAPTURE;
+}
+
+static int query_current_frame_size(AVFormatContext *ctx)
+{
+    struct video_data *s = ctx->priv_data;
+    struct v4l2_format fmt = { .type = s->buf_type };
+    int ret;
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "Querying the device for the current frame size\n");
+    if (s->ioctl_f(s->fd, VIDIOC_G_FMT, &fmt) < 0) {
+        ret = AVERROR(errno);
+        av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_G_FMT): %s\n",
+               av_err2str(ret));
+        return ret;
+    }
+
+    if (s->multiplanar) {
+        s->width  = fmt.fmt.pix_mp.width;
+        s->height = fmt.fmt.pix_mp.height;
+    } else {
+        s->width  = fmt.fmt.pix.width;
+        s->height = fmt.fmt.pix.height;
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "Setting frame size to %dx%d\n", s->width, s->height);
+    return 0;
+}
 
 static int device_open(AVFormatContext *ctx, const char* device_path)
 {
@@ -198,12 +235,13 @@ static int device_open(AVFormatContext *ctx, const char* device_path)
         caps = cap.device_caps;
 #endif
 
-    if (caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
-        s->multiplanar = 1;
-        s->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    } else if (caps & V4L2_CAP_VIDEO_CAPTURE) {
-        s->multiplanar = 0;
-        s->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    s->has_capture_mplane = !!(caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE);
+    s->has_capture        = !!(caps & V4L2_CAP_VIDEO_CAPTURE);
+
+    if (s->has_capture_mplane) {
+        select_capture_type(s, 1);
+    } else if (s->has_capture) {
+        select_capture_type(s, 0);
     } else {
         av_log(ctx, AV_LOG_ERROR, "Not a video capture device.\n");
         err = AVERROR(ENODEV);
@@ -1135,6 +1173,9 @@ static int v4l2_read_header(AVFormatContext *ctx)
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
     struct v4l2_input input = { 0 };
     int input_probe_ignored = 0;
+    int requested_width;
+    int requested_height;
+    int tried_single_planar = 0;
 
     st = avformat_new_stream(ctx, NULL);
     if (!st)
@@ -1220,27 +1261,36 @@ static int v4l2_read_header(AVFormatContext *ctx)
         }
     }
 
-    if (!s->width && !s->height) {
-        struct v4l2_format fmt = { .type = s->buf_type };
+    requested_width  = s->width;
+    requested_height = s->height;
 
-        av_log(ctx, AV_LOG_VERBOSE,
-               "Querying the device for the current frame size\n");
-        if (v4l2_ioctl(s->fd, VIDIOC_G_FMT, &fmt) < 0) {
-            res = AVERROR(errno);
-            av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_G_FMT): %s\n",
-                   av_err2str(res));
-            goto fail;
-        }
+retry_setup:
+    s->width       = requested_width;
+    s->height      = requested_height;
+    s->frame_size  = 0;
+    desired_format = 0;
+    codec_id       = AV_CODEC_ID_NONE;
+    st->codecpar->format = AV_PIX_FMT_NONE;
 
-        s->width  = fmt.fmt.pix.width;
-        s->height = fmt.fmt.pix.height;
-        av_log(ctx, AV_LOG_VERBOSE,
-               "Setting frame size to %dx%d\n", s->width, s->height);
-    }
+    if (!s->width && !s->height &&
+        (res = query_current_frame_size(ctx)) < 0)
+        goto retry_or_fail;
 
     res = device_try_init(ctx, pix_fmt, &s->width, &s->height, &desired_format, &codec_id);
     if (res < 0)
+        goto retry_or_fail;
+
+    if ((res = av_image_check_size(s->width, s->height, 0, ctx)) < 0)
         goto fail;
+
+    s->pixelformat = desired_format;
+
+    st->codecpar->format = ff_fmt_v4l2ff(desired_format, codec_id);
+    if (st->codecpar->format != AV_PIX_FMT_NONE)
+        s->frame_size = av_image_get_buffer_size(st->codecpar->format,
+                                                 s->width, s->height, 1);
+    if ((res = validate_multiplanar_raw_layout(ctx, st->codecpar->format)) < 0)
+        goto retry_or_fail;
 
     /* If no pixel_format was specified, the codec_id was not known up
      * until now. Set video_codec_id in the context, as codec_id will
@@ -1249,19 +1299,7 @@ static int v4l2_read_header(AVFormatContext *ctx)
     if (codec_id != AV_CODEC_ID_NONE && ctx->video_codec_id == AV_CODEC_ID_NONE)
         ctx->video_codec_id = codec_id;
 
-    if ((res = av_image_check_size(s->width, s->height, 0, ctx)) < 0)
-        goto fail;
-
-    s->pixelformat = desired_format;
-
     if ((res = v4l2_set_parameters(ctx)) < 0)
-        goto fail;
-
-    st->codecpar->format = ff_fmt_v4l2ff(desired_format, codec_id);
-    if (st->codecpar->format != AV_PIX_FMT_NONE)
-        s->frame_size = av_image_get_buffer_size(st->codecpar->format,
-                                                 s->width, s->height, 1);
-    if ((res = validate_multiplanar_raw_layout(ctx, st->codecpar->format)) < 0)
         goto fail;
 
     if ((res = mmap_init(ctx)) ||
@@ -1288,6 +1326,16 @@ static int v4l2_read_header(AVFormatContext *ctx)
         st->codecpar->bit_rate = s->frame_size * av_q2d(st->avg_frame_rate) * 8;
 
     return 0;
+
+retry_or_fail:
+    if (s->multiplanar && s->has_capture && !tried_single_planar) {
+        av_log(ctx, AV_LOG_VERBOSE,
+               "MPLANE capture setup failed, retrying single-planar capture\n");
+        tried_single_planar = 1;
+        select_capture_type(s, 0);
+        goto retry_setup;
+    }
+    goto fail;
 
 fail:
     v4l2_close(s->fd);

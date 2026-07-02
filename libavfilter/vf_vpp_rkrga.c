@@ -112,14 +112,26 @@ static int vpp_source_size_forces_rga2(int width, int height)
            (width < 68 || width > 8176 || height < 2 || height > 8176);
 }
 
+static int vpp_transpose_swaps_dimensions(int transpose)
+{
+    return transpose == TRANSPOSE_CCLOCK_FLIP ||
+           transpose == TRANSPOSE_CLOCK ||
+           transpose == TRANSPOSE_CCLOCK ||
+           transpose == TRANSPOSE_CLOCK_FLIP;
+}
+
 static int vpp_scale_forces_rga2(int src_width, int src_height,
-                                 int out_width, int out_height)
+                                 int out_width, int out_height,
+                                 int transpose)
 {
     float scale_ratio_w, scale_ratio_h;
 
     if (src_width <= 0 || src_height <= 0 ||
         out_width <= 0 || out_height <= 0)
         return 0;
+
+    if (vpp_transpose_swaps_dimensions(transpose))
+        FFSWAP(int, src_width, src_height);
 
     scale_ratio_w = (float)out_width / (float)src_width;
     scale_ratio_h = (float)out_height / (float)src_height;
@@ -389,7 +401,7 @@ static av_cold void config_force_format(AVFilterContext *ctx,
                vpp_source_size_forces_rga2(src_width, src_height) ||
                vpp_output_size_forces_rga2(out_width, out_height) ||
                vpp_scale_forces_rga2(src_width, src_height,
-                                     out_width, out_height);
+                                     out_width, out_height, r->transpose);
     if (out_depth >= 10 && use_rga2)
         out_depth = 8;
 
