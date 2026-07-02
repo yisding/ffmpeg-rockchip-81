@@ -444,7 +444,9 @@ not_ready:
     return FFERROR_NOT_READY;
 
 eof:
-    ff_rkrga_filter_frame(&r->rga, inlink, NULL, NULL, NULL);
+    ret = ff_rkrga_filter_frame(&r->rga, inlink, NULL, NULL, NULL);
+    if (ret < 0)
+        return ret;
 
     pts = av_rescale_q(pts, inlink->time_base, outlink->time_base);
     ff_outlink_set_status(outlink, AVERROR_EOF, pts);
