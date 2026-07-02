@@ -33,6 +33,7 @@
 
 #include "rkmppdec.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #if CONFIG_RKRGA
@@ -174,6 +175,9 @@ static int rkmpp_mjpeg_output_buffer_size(AVCodecContext *avctx,
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
                                 int *stride, int reverse)
 {
+    int64_t scaled_stride;
+    int64_t divisor = 1;
+
     if (!desc || !stride || *stride <= 0)
         return AVERROR(EINVAL);
 
@@ -183,16 +187,38 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
          !(desc->flags & AV_PIX_FMT_FLAG_PLANAR)))
         return 0;
 
-    if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1)
-        *stride = reverse ? (*stride * 2 / 3) : (*stride * 3 / 2);
-    else if (desc->log2_chroma_w == 1 && !desc->log2_chroma_h)
-        *stride = reverse ? (*stride / 2) : (*stride * 2);
-    else if (!desc->log2_chroma_w && !desc->log2_chroma_h)
-        *stride = reverse ? (*stride / 3) : (*stride * 3);
-    else
+    scaled_stride = *stride;
+    if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1) {
+        if (reverse) {
+            scaled_stride *= 2;
+            divisor = 3;
+        } else {
+            scaled_stride *= 3;
+            divisor = 2;
+        }
+    } else if (desc->log2_chroma_w == 1 && !desc->log2_chroma_h) {
+        if (reverse)
+            divisor = 2;
+        else
+            scaled_stride *= 2;
+    } else if (!desc->log2_chroma_w && !desc->log2_chroma_h) {
+        if (reverse)
+            divisor = 3;
+        else
+            scaled_stride *= 3;
+    } else {
+        return AVERROR(EINVAL);
+    }
+
+    if (scaled_stride % divisor)
         return AVERROR(EINVAL);
 
-    return (*stride > 0) ? 0 : AVERROR(EINVAL);
+    scaled_stride /= divisor;
+    if (scaled_stride <= 0 || scaled_stride > INT_MAX)
+        return AVERROR(EINVAL);
+
+    *stride = scaled_stride;
+    return 0;
 }
 
 static int rkmpp_afbc_rga_supported(int width, int height,
@@ -701,6 +727,9 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     layer->planes[0].object_index = 0;
 
     if (is_fbc) {
+        uint32_t afbc_pixel_stride;
+        int pitch;
+
         if (mpp_fmt & MPP_FRAME_FBC_RKFBC) {
             av_log(avctx, AV_LOG_ERROR,
                    "RKFBC DRM export is not supported without an official DRM modifier\n");
@@ -714,11 +743,21 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         layer->format = rkmpp_get_drm_afbc_format(mpp_fmt);
         layer->nb_planes = 1;
         layer->planes[0].offset = 0;
-        layer->planes[0].pitch  = mpp_frame_get_hor_stride(mpp_frame);
 
         pix_desc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
-        if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0)
+        afbc_pixel_stride = mpp_frame_get_fbc_hdr_stride(mpp_frame);
+        if (!afbc_pixel_stride)
+            afbc_pixel_stride = mpp_frame_get_hor_stride_pixel(mpp_frame);
+        if (!afbc_pixel_stride || afbc_pixel_stride > INT_MAX) {
+            ret = AVERROR(EINVAL);
             goto fail;
+        }
+
+        pitch = afbc_pixel_stride;
+        ret = get_afbc_byte_stride(pix_desc, &pitch, 0);
+        if (ret < 0)
+            goto fail;
+        layer->planes[0].pitch = pitch;
 
         desc->afbc_offset_y = mpp_frame_get_offset_y(mpp_frame);
     } else {

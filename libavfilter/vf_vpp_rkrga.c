@@ -75,6 +75,59 @@ enum {
     FORCE_CHROMA_NB
 };
 
+static int vpp_rga2_core_mask(int scheduler_core)
+{
+    return scheduler_core && scheduler_core == (scheduler_core & 0xc);
+}
+
+static int vpp_input_forces_rga2(enum AVPixelFormat pix_fmt)
+{
+    switch (pix_fmt) {
+    case AV_PIX_FMT_GRAY8:
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUV422P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_RGB555LE:
+    case AV_PIX_FMT_BGR555LE:
+    case AV_PIX_FMT_NV15:
+    case AV_PIX_FMT_NV20_PACKED:
+    case AV_PIX_FMT_NV24:
+    case AV_PIX_FMT_NV42:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int vpp_output_size_forces_rga2(int width, int height)
+{
+    return width > 0 && height > 0 &&
+           (width < 68 || width > 8128 || height < 2 || height > 8128);
+}
+
+static int vpp_source_size_forces_rga2(int width, int height)
+{
+    return width > 0 && height > 0 &&
+           (width < 68 || width > 8176 || height < 2 || height > 8176);
+}
+
+static int vpp_scale_forces_rga2(int src_width, int src_height,
+                                 int out_width, int out_height)
+{
+    float scale_ratio_w, scale_ratio_h;
+
+    if (src_width <= 0 || src_height <= 0 ||
+        out_width <= 0 || out_height <= 0)
+        return 0;
+
+    scale_ratio_w = (float)out_width / (float)src_width;
+    scale_ratio_h = (float)out_height / (float)src_height;
+
+    return scale_ratio_w < 0.125f || scale_ratio_w > 8.0f ||
+           scale_ratio_h < 0.125f || scale_ratio_h > 8.0f;
+}
+
 static const char *const var_names[] = {
     "iw", "in_w",
     "ih", "in_h",
@@ -288,13 +341,22 @@ static av_cold int set_size_info(AVFilterContext *ctx,
 
 static av_cold void config_force_format(AVFilterContext *ctx,
                                         enum AVPixelFormat in_format,
+                                        int src_width,
+                                        int src_height,
+                                        int out_width,
+                                        int out_height,
                                         enum AVPixelFormat *out_format)
 {
     RGAVppContext *r = ctx->priv;
     const AVPixFmtDescriptor *desc;
     const char *rga_ver = NULL;
+    int has_rga2 = 0;
+    int has_rga2p = 0;
     int has_rga3 = 0;
+    int rga_core_mask = 0x7;
+    int use_rga2_core;
     int out_depth, force_chroma;
+    int use_rga2;
     int is_yuv, is_fully_planar;
 
     if (!out_format)
@@ -312,8 +374,23 @@ static av_cold void config_force_format(AVFilterContext *ctx,
 
     /* Auto fallback to 8-bit fmts on RGA2 */
     rga_ver = querystring(RGA_VERSION);
+    has_rga2 = !!strstr(rga_ver, "RGA_2");
+    has_rga2p = !!strstr(rga_ver, "RGA_2_PRO");
     has_rga3 = !!strstr(rga_ver, "RGA_3");
-    if (out_depth >= 10 && !has_rga3)
+    if (has_rga2p)
+        rga_core_mask = 0xf;
+    use_rga2_core = vpp_rga2_core_mask(r->rga.scheduler_core) &&
+                    ((has_rga2 && has_rga3) || has_rga2p) &&
+                    r->rga.scheduler_core ==
+                    (r->rga.scheduler_core & rga_core_mask);
+    use_rga2 = !has_rga3 ||
+               use_rga2_core ||
+               vpp_input_forces_rga2(in_format) ||
+               vpp_source_size_forces_rga2(src_width, src_height) ||
+               vpp_output_size_forces_rga2(out_width, out_height) ||
+               vpp_scale_forces_rga2(src_width, src_height,
+                                     out_width, out_height);
+    if (out_depth >= 10 && use_rga2)
         out_depth = 8;
 
     desc = av_pix_fmt_desc_get(in_format);
@@ -367,11 +444,12 @@ static av_cold int rgavpp_config_props(AVFilterLink *outlink)
     in_format     = in_frames_ctx->sw_format;
     out_format    = (r->format == AV_PIX_FMT_NONE) ? in_format : r->format;
 
-    config_force_format(ctx, in_format, &out_format);
-
     ret = set_size_info(ctx, inlink, outlink);
     if (ret < 0)
         return ret;
+
+    config_force_format(ctx, in_format, r->act_w, r->act_h,
+                        outlink->w, outlink->h, &out_format);
 
     param.filter_frame   = NULL;
     param.out_sw_format  = out_format;
