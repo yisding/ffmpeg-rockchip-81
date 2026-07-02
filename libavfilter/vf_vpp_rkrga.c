@@ -169,11 +169,11 @@ static av_cold int eval_expr(AVFilterContext *ctx,
               var_values[VAR_OUT_W] = var_values[VAR_OW] = var_values[VAR_W],
               *ret_w, var_values[VAR_CW]);
 
-    CALC_EXPR(cx_expr, var_values[VAR_CX], *ret_cx, (var_values[VAR_IW] - var_values[VAR_OW]) / 2);
-    CALC_EXPR(cy_expr, var_values[VAR_CY], *ret_cy, (var_values[VAR_IH] - var_values[VAR_OH]) / 2);
+    CALC_EXPR(cx_expr, var_values[VAR_CX], *ret_cx, (var_values[VAR_IW] - var_values[VAR_CW]) / 2);
+    CALC_EXPR(cy_expr, var_values[VAR_CY], *ret_cy, (var_values[VAR_IH] - var_values[VAR_CH]) / 2);
 
     /* calc again in case cx is relative to cy */
-    CALC_EXPR(cx_expr, var_values[VAR_CX], *ret_cx, (var_values[VAR_IW] - var_values[VAR_OW]) / 2);
+    CALC_EXPR(cx_expr, var_values[VAR_CX], *ret_cx, (var_values[VAR_IW] - var_values[VAR_CW]) / 2);
 
     r->crop = (*ret_cw != var_values[VAR_IW]) || (*ret_ch != var_values[VAR_IH]);
 
@@ -550,8 +550,8 @@ static const AVOption rgavpp_options[] = {
     { "h",  "Output video height",                 OFFSET(oh), AV_OPT_TYPE_STRING, { .str = "w*ch/cw" }, 0, 0, FLAGS },
     { "cw", "Set the width crop area expression",  OFFSET(cw), AV_OPT_TYPE_STRING, { .str = "iw" }, 0, 0, FLAGS },
     { "ch", "Set the height crop area expression", OFFSET(ch), AV_OPT_TYPE_STRING, { .str = "ih" }, 0, 0, FLAGS },
-    { "cx", "Set the x crop area expression",      OFFSET(cx), AV_OPT_TYPE_STRING, { .str = "(in_w-out_w)/2" }, 0, 0, FLAGS },
-    { "cy", "Set the y crop area expression",      OFFSET(cy), AV_OPT_TYPE_STRING, { .str = "(in_h-out_h)/2" }, 0, 0, FLAGS },
+    { "cx", "Set the x crop area expression",      OFFSET(cx), AV_OPT_TYPE_STRING, { .str = "(in_w-cw)/2" }, 0, 0, FLAGS },
+    { "cy", "Set the y crop area expression",      OFFSET(cy), AV_OPT_TYPE_STRING, { .str = "(in_h-ch)/2" }, 0, 0, FLAGS },
     { "format", "Output video pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NONE }, INT_MIN, INT_MAX, .flags = FLAGS },
     { "transpose", "Set transpose direction", OFFSET(transpose), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 6, FLAGS, "transpose" },
         { "cclock_hflip", "Rotate counter-clockwise with horizontal flip", 0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK_FLIP }, 0, 0, FLAGS, "transpose" },
