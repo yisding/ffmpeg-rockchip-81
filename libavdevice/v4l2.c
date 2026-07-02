@@ -139,6 +139,7 @@ static int device_open(AVFormatContext *ctx, const char* device_path)
     int fd;
     int err;
     int flags = O_RDWR;
+    uint32_t caps;
 
 #define SET_WRAPPERS(prefix) do {       \
     s->open_f   = prefix ## open;       \
@@ -191,19 +192,25 @@ static int device_open(AVFormatContext *ctx, const char* device_path)
     av_log(ctx, AV_LOG_VERBOSE, "fd:%d capabilities:%x\n",
            fd, cap.capabilities);
 
-    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
-        s->multiplanar = 0;
-        s->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    } else if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
+    caps = cap.capabilities;
+#ifdef V4L2_CAP_DEVICE_CAPS
+    if (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+        caps = cap.device_caps;
+#endif
+
+    if (caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
         s->multiplanar = 1;
         s->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    } else if (caps & V4L2_CAP_VIDEO_CAPTURE) {
+        s->multiplanar = 0;
+        s->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     } else {
         av_log(ctx, AV_LOG_ERROR, "Not a video capture device.\n");
         err = AVERROR(ENODEV);
         goto fail;
     }
 
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+    if (!(caps & V4L2_CAP_STREAMING)) {
         av_log(ctx, AV_LOG_ERROR,
                "The device does not support the streaming I/O method.\n");
         err = AVERROR(ENOSYS);
@@ -587,7 +594,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     };
     struct timeval buf_ts;
     unsigned int plane_payload[VIDEO_MAX_PLANES] = { 0 };
-    unsigned int bytesused = 0;
+    size_t bytesused = 0;
     int res;
 
     pkt->size = 0;
@@ -623,28 +630,60 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
 
     if (s->multiplanar) {
         for (int plane = 0; plane < buf.length; plane++) {
-            if (buf.m.planes[plane].bytesused < buf.m.planes[plane].data_offset) {
+            unsigned int plane_bytesused = buf.m.planes[plane].bytesused;
+            unsigned int data_offset = buf.m.planes[plane].data_offset;
+            unsigned int mapped_len = s->buf_data[buf.index].len[plane];
+
+            if (plane_bytesused < data_offset) {
                 av_log(ctx, AV_LOG_ERROR,
                        "Dequeued v4l2 buffer plane %d contains %u bytes, "
                        "below data offset %u.\n",
-                       plane, buf.m.planes[plane].bytesused,
-                       buf.m.planes[plane].data_offset);
+                       plane, plane_bytesused, data_offset);
+                res = enqueue_buffer(s, &buf);
+                return res ? res : AVERROR(EINVAL);
+            }
+            if (data_offset > mapped_len || plane_bytesused > mapped_len) {
+                av_log(ctx, AV_LOG_ERROR,
+                       "Dequeued v4l2 buffer plane %d uses %u bytes with "
+                       "data offset %u, exceeding mapped length %u.\n",
+                       plane, plane_bytesused, data_offset, mapped_len);
                 res = enqueue_buffer(s, &buf);
                 return res ? res : AVERROR(EINVAL);
             }
 
-            plane_payload[plane] = buf.m.planes[plane].bytesused -
-                                   buf.m.planes[plane].data_offset;
+            plane_payload[plane] = plane_bytesused - data_offset;
             bytesused += plane_payload[plane];
+            if (bytesused > INT_MAX) {
+                av_log(ctx, AV_LOG_ERROR,
+                       "Dequeued v4l2 buffer is too large: %zu bytes.\n",
+                       bytesused);
+                res = enqueue_buffer(s, &buf);
+                return res ? res : AVERROR(EINVAL);
+            }
         }
     } else {
         bytesused = buf.bytesused;
+        if (bytesused > s->buf_data[buf.index].len[0]) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Dequeued v4l2 buffer uses %zu bytes, exceeding mapped length %u.\n",
+                   bytesused, s->buf_data[buf.index].len[0]);
+            res = enqueue_buffer(s, &buf);
+            return res ? res : AVERROR(EINVAL);
+        }
+    }
+
+    if (bytesused > INT_MAX) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Dequeued v4l2 buffer is too large: %zu bytes.\n",
+               bytesused);
+        res = enqueue_buffer(s, &buf);
+        return res ? res : AVERROR(EINVAL);
     }
 
 #ifdef V4L2_BUF_FLAG_ERROR
     if (buf.flags & V4L2_BUF_FLAG_ERROR) {
         av_log(ctx, AV_LOG_WARNING,
-               "Dequeued v4l2 buffer contains corrupted data (%d bytes).\n",
+               "Dequeued v4l2 buffer contains corrupted data (%zu bytes).\n",
                bytesused);
         bytesused = 0;
         if (s->multiplanar) {
@@ -665,7 +704,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
 
         if (s->frame_size > 0 && bytesused != s->frame_size) {
             av_log(ctx, AV_LOG_WARNING,
-                   "Dequeued v4l2 buffer contains %d bytes, but %d were expected. Flags: 0x%08X.\n",
+                   "Dequeued v4l2 buffer contains %zu bytes, but %d were expected. Flags: 0x%08X.\n",
                    bytesused, s->frame_size, buf.flags);
             bytesused = 0;
             if (s->multiplanar) {
@@ -683,14 +722,14 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     if (s->multiplanar ||
         atomic_load(&s->buffers_queued) == FFMAX(s->buffers / 8, 1)) {
         /* when we start getting low on queued buffers, fall back on copying data */
-        res = av_new_packet(pkt, bytesused);
+        res = av_new_packet(pkt, (int)bytesused);
         if (res < 0) {
             av_log(ctx, AV_LOG_ERROR, "Error allocating a packet.\n");
             enqueue_buffer(s, &buf);
             return res;
         }
         if (s->multiplanar) {
-            unsigned int offset = 0;
+            size_t offset = 0;
 
             for (int plane = 0; plane < buf.length; plane++) {
                 if (plane_payload[plane]) {
@@ -714,7 +753,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         struct buf_desc *buf_descriptor;
 
         pkt->data     = s->buf_data[buf.index].start[0];
-        pkt->size     = bytesused;
+        pkt->size     = (int)bytesused;
 
         buf_descriptor = av_malloc(sizeof(struct buf_desc));
         if (!buf_descriptor) {
@@ -790,6 +829,78 @@ static void mmap_close(struct video_data *s)
      */
     v4l2_ioctl(s->fd, VIDIOC_STREAMOFF, &type);
     mmap_free(s, s->buffers);
+}
+
+static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
+                                           enum AVPixelFormat pix_fmt)
+{
+    struct video_data *s = ctx->priv_data;
+    struct v4l2_format fmt = { .type = s->buf_type };
+    int image_linesizes[4] = { 0 };
+    ptrdiff_t linesizes[4] = { 0 };
+    size_t plane_sizes[4] = { 0 };
+    int nb_planes, ret;
+
+    if (!s->multiplanar || pix_fmt == AV_PIX_FMT_NONE)
+        return 0;
+
+    nb_planes = av_pix_fmt_count_planes(pix_fmt);
+    if (nb_planes < 1 || nb_planes > VIDEO_MAX_PLANES)
+        return AVERROR(EINVAL);
+
+    ret = av_image_fill_linesizes(image_linesizes, pix_fmt, s->width);
+    if (ret < 0)
+        return ret;
+    for (int i = 0; i < FF_ARRAY_ELEMS(linesizes); i++)
+        linesizes[i] = image_linesizes[i];
+
+    ret = av_image_fill_plane_sizes(plane_sizes, pix_fmt, s->height, linesizes);
+    if (ret < 0)
+        return ret;
+
+    if (v4l2_ioctl(s->fd, VIDIOC_G_FMT, &fmt) < 0) {
+        ret = AVERROR(errno);
+        av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_G_FMT): %s\n", av_err2str(ret));
+        return ret;
+    }
+
+    if (fmt.fmt.pix_mp.num_planes == 1) {
+        const struct v4l2_plane_pix_format *plane_fmt = &fmt.fmt.pix_mp.plane_fmt[0];
+
+        if (plane_fmt->bytesperline == linesizes[0] &&
+            plane_fmt->sizeimage >= s->frame_size)
+            return 0;
+
+        av_log(ctx, AV_LOG_ERROR,
+               "Unsupported padded single-plane MPLANE raw layout: "
+               "bytesperline=%u sizeimage=%u expected bytesperline=%d min sizeimage=%d\n",
+               plane_fmt->bytesperline, plane_fmt->sizeimage,
+               image_linesizes[0], s->frame_size);
+        return AVERROR(ENOSYS);
+    }
+
+    if (fmt.fmt.pix_mp.num_planes != nb_planes) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Unsupported MPLANE raw layout: driver exposes %u planes, expected 1 or %d\n",
+               fmt.fmt.pix_mp.num_planes, nb_planes);
+        return AVERROR(EINVAL);
+    }
+
+    for (int i = 0; i < nb_planes; i++) {
+        const struct v4l2_plane_pix_format *plane_fmt = &fmt.fmt.pix_mp.plane_fmt[i];
+
+        if (plane_fmt->bytesperline != linesizes[i] ||
+            plane_fmt->sizeimage < plane_sizes[i]) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Unsupported padded MPLANE raw layout in plane %d: "
+                   "bytesperline=%u sizeimage=%u expected bytesperline=%d min sizeimage=%zu\n",
+                   i, plane_fmt->bytesperline, plane_fmt->sizeimage,
+                   image_linesizes[i], plane_sizes[i]);
+            return AVERROR(ENOSYS);
+        }
+    }
+
+    return 0;
 }
 
 static int v4l2_set_parameters(AVFormatContext *ctx)
@@ -975,8 +1086,10 @@ static int device_try_init(AVFormatContext *ctx,
 
     if (!*desired_format) {
         for (i = 0; ff_fmt_conversion_table[i].codec_id != AV_CODEC_ID_NONE; i++) {
-            if (ctx->video_codec_id == AV_CODEC_ID_NONE ||
-                ff_fmt_conversion_table[i].codec_id == ctx->video_codec_id) {
+            if ((ctx->video_codec_id == AV_CODEC_ID_NONE ||
+                 ff_fmt_conversion_table[i].codec_id == ctx->video_codec_id) &&
+                (pix_fmt == AV_PIX_FMT_NONE ||
+                 ff_fmt_conversion_table[i].ff_fmt == pix_fmt)) {
                 av_log(ctx, AV_LOG_DEBUG, "Trying to set codec:%s pix_fmt:%s\n",
                        avcodec_get_name(ff_fmt_conversion_table[i].codec_id),
                        (char *)av_x_if_null(av_get_pix_fmt_name(ff_fmt_conversion_table[i].ff_fmt), "none"));
@@ -1149,6 +1262,8 @@ static int v4l2_read_header(AVFormatContext *ctx)
     if (st->codecpar->format != AV_PIX_FMT_NONE)
         s->frame_size = av_image_get_buffer_size(st->codecpar->format,
                                                  s->width, s->height, 1);
+    if ((res = validate_multiplanar_raw_layout(ctx, st->codecpar->format)) < 0)
+        goto fail;
 
     if ((res = mmap_init(ctx)) ||
         (res = mmap_start(ctx)) < 0)
