@@ -440,14 +440,15 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
     }
 
     if (r->afbc) {
-        MppFrameFormat afbc_fmt = MPP_FRAME_FBC_AFBC_V2;
+        MppFrameFormat afbc_fmt = r->use_rfbc ? MPP_FRAME_FBC_RKFBC
+                                               : MPP_FRAME_FBC_AFBC_V2;
 
         if (avctx->codec_id == AV_CODEC_ID_H264 ||
             avctx->codec_id == AV_CODEC_ID_HEVC ||
             avctx->codec_id == AV_CODEC_ID_VP9 ||
             avctx->codec_id == AV_CODEC_ID_AV1) {
             if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_OUTPUT_FORMAT, &afbc_fmt)) != MPP_OK) {
-                av_log(avctx, AV_LOG_ERROR, "Failed to set AFBC mode: %d\n", ret);
+                av_log(avctx, AV_LOG_ERROR, "Failed to set FBC mode: %d\n", ret);
                 ret = AVERROR_EXTERNAL;
                 goto fail;
             }
@@ -714,7 +715,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     MppBuffer mpp_buf = NULL;
     MppFrameFormat mpp_fmt = MPP_FMT_BUTT;
     int mpp_frame_mode = 0;
-    int ret, is_afbc = 0;
+    int ret, is_fbc = 0, is_rfbc = 0;
 
     if (!frame || !mpp_frame) {
         ret = AVERROR(ENOMEM);
@@ -739,16 +740,17 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     desc->drm_desc.objects[0].size = mpp_buffer_get_size(mpp_buf);
 
     mpp_fmt = mpp_frame_get_fmt(mpp_frame);
-    is_afbc = mpp_fmt & MPP_FRAME_FBC_MASK;
+    is_fbc  = mpp_fmt & MPP_FRAME_FBC_MASK;
+    is_rfbc = mpp_fmt & MPP_FRAME_FBC_RKFBC;
 
     desc->drm_desc.nb_layers = 1;
     layer = &desc->drm_desc.layers[0];
     layer->planes[0].object_index = 0;
 
-    if (is_afbc) {
+    if (is_fbc) {
         desc->drm_desc.objects[0].format_modifier =
-            r->use_rfbc ? DRM_FORMAT_MOD_ROCKCHIP_RFBC(ROCKCHIP_RFBC_BLOCK_SIZE_64x4)
-                        : DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE | AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
+            is_rfbc ? DRM_FORMAT_MOD_ROCKCHIP_RFBC(ROCKCHIP_RFBC_BLOCK_SIZE_64x4)
+                    : DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE | AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
 
         layer->format = rkmpp_get_drm_afbc_format(mpp_fmt);
         layer->nb_planes = 1;
@@ -759,7 +761,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0)
             goto fail;
 
-        desc->afbc_offset_y = r->use_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
+        desc->afbc_offset_y = is_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
     } else {
         layer->format = rkmpp_get_drm_format(mpp_fmt);
         layer->nb_planes = 2;
