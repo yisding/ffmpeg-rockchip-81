@@ -105,6 +105,8 @@ struct video_data {
 
     int buffers;
     int plane_count;
+    int raw_plane_count;
+    size_t raw_plane_size[VIDEO_MAX_PLANES];
     atomic_int buffers_queued;
     struct buf_data *buf_data;
     char *standard;
@@ -631,7 +633,7 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         .length   = s->multiplanar ? s->plane_count : 0,
     };
     struct timeval buf_ts;
-    unsigned int plane_payload[VIDEO_MAX_PLANES] = { 0 };
+    size_t plane_payload[VIDEO_MAX_PLANES] = { 0 };
     size_t bytesused = 0;
     int res;
 
@@ -697,6 +699,14 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
                        bytesused);
                 res = enqueue_buffer(s, &buf);
                 return res ? res : AVERROR(EINVAL);
+            }
+        }
+        if (s->raw_plane_count > 0) {
+            bytesused = 0;
+            for (int plane = 0; plane < s->raw_plane_count; plane++) {
+                plane_payload[plane] = FFMIN(plane_payload[plane],
+                                             s->raw_plane_size[plane]);
+                bytesused += plane_payload[plane];
             }
         }
     } else {
@@ -878,6 +888,8 @@ static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
     size_t plane_sizes[4] = { 0 };
     int nb_planes, ret;
 
+    s->raw_plane_count = 0;
+
     if (!s->multiplanar || pix_fmt == AV_PIX_FMT_NONE)
         return 0;
 
@@ -905,8 +917,11 @@ static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
         const struct v4l2_plane_pix_format *plane_fmt = &fmt.fmt.pix_mp.plane_fmt[0];
 
         if (plane_fmt->bytesperline == linesizes[0] &&
-            plane_fmt->sizeimage >= s->frame_size)
+            plane_fmt->sizeimage >= s->frame_size) {
+            s->raw_plane_count = 1;
+            s->raw_plane_size[0] = s->frame_size;
             return 0;
+        }
 
         av_log(ctx, AV_LOG_ERROR,
                "Unsupported padded single-plane MPLANE raw layout: "
@@ -936,6 +951,10 @@ static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
             return AVERROR(ENOSYS);
         }
     }
+
+    s->raw_plane_count = nb_planes;
+    for (int i = 0; i < nb_planes; i++)
+        s->raw_plane_size[i] = plane_sizes[i];
 
     return 0;
 }
@@ -1268,6 +1287,7 @@ retry_setup:
     s->width       = requested_width;
     s->height      = requested_height;
     s->frame_size  = 0;
+    s->raw_plane_count = 0;
     desired_format = 0;
     codec_id       = AV_CODEC_ID_NONE;
     st->codecpar->format = AV_PIX_FMT_NONE;
