@@ -64,6 +64,10 @@
 #ifndef AFBC_FORMAT_MOD_SPARSE
 #define AFBC_FORMAT_MOD_SPARSE             (1ULL << 6)
 #endif
+#ifndef fourcc_mod_code
+#define fourcc_mod_code(vendor, val) \
+        ((((__u64)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
+#endif
 #ifndef DRM_FORMAT_MOD_ARM_CODE
 #define DRM_FORMAT_MOD_ARM_CODE(__type, __val) \
         fourcc_mod_code(ARM, ((__u64)(__type) << 52) | ((__val) & 0x000fffffffffffffULL))
@@ -76,35 +80,6 @@
 #define drm_is_afbc(mod) \
         (((mod) >> 52) == (DRM_FORMAT_MOD_ARM_TYPE_AFBC | \
                 (DRM_FORMAT_MOD_VENDOR_ARM << 4)))
-
-/* Rockchip RFBC (64x4) */
-#undef  DRM_FORMAT_MOD_VENDOR_ROCKCHIP
-#define DRM_FORMAT_MOD_VENDOR_ROCKCHIP     0x0b
-#undef  DRM_FORMAT_MOD_ROCKCHIP_TYPE_SHIFT
-#define DRM_FORMAT_MOD_ROCKCHIP_TYPE_SHIFT 52
-#undef  DRM_FORMAT_MOD_ROCKCHIP_TYPE_MASK
-#define DRM_FORMAT_MOD_ROCKCHIP_TYPE_MASK  0xf
-#undef  DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC
-#define DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC  0x1
-#undef  ROCKCHIP_RFBC_BLOCK_SIZE_64x4
-#define ROCKCHIP_RFBC_BLOCK_SIZE_64x4      (1ULL)
-
-#undef  fourcc_mod_code
-#define fourcc_mod_code(vendor, val) \
-        ((((__u64)DRM_FORMAT_MOD_VENDOR_## vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
-
-#undef  DRM_FORMAT_MOD_ROCKCHIP_CODE
-#define DRM_FORMAT_MOD_ROCKCHIP_CODE(__type, __val) \
-	fourcc_mod_code(ROCKCHIP, ((__u64)(__type) << DRM_FORMAT_MOD_ROCKCHIP_TYPE_SHIFT) | \
-			((__val) & 0x000fffffffffffffULL))
-
-#undef  DRM_FORMAT_MOD_ROCKCHIP_RFBC
-#define DRM_FORMAT_MOD_ROCKCHIP_RFBC(mode) \
-	DRM_FORMAT_MOD_ROCKCHIP_CODE(DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC, mode)
-
-#define drm_is_rfbc(mod) \
-        (((((mod) >> 56) & 0xff) == DRM_FORMAT_MOD_VENDOR_ROCKCHIP) && \
-         ((((mod) >> 52) & DRM_FORMAT_MOD_ROCKCHIP_TYPE_MASK) == DRM_FORMAT_MOD_ROCKCHIP_TYPE_RFBC))
 
 /**
  * DRM Prime Frame descriptor for RKMPP HWDevice.

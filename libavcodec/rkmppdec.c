@@ -33,10 +33,8 @@
 
 #include "rkmppdec.h"
 
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 #if CONFIG_RKRGA
 #include <rga/im2d.h>
 #endif
@@ -197,40 +195,6 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
     return (*stride > 0) ? 0 : AVERROR(EINVAL);
 }
 
-static void read_soc_name(AVCodecContext *avctx, char *name, int size)
-{
-    const char *dt_path = "/proc/device-tree/compatible";
-    int fd;
-
-    if (size <= 0)
-        return;
-
-    snprintf(name, size, "unknown");
-
-    fd = open(dt_path, O_RDONLY);
-    if (fd < 0) {
-        av_log(avctx, AV_LOG_VERBOSE, "Unable to open '%s' for reading SoC name\n", dt_path);
-    } else {
-        ssize_t soc_name_len = 0;
-
-        soc_name_len = read(fd, name, size - 1);
-        if (soc_name_len > 0) {
-            name[soc_name_len] = '\0';
-            /* replacing the termination character to space */
-            for (char *ptr = name;; ptr = name) {
-                ptr += av_strnlen(name, size);
-                if (ptr >= name + soc_name_len - 1)
-                    break;
-                *ptr = ' ';
-            }
-
-            av_log(avctx, AV_LOG_VERBOSE, "Found SoC name from device-tree: '%s'\n", name);
-        }
-
-        close(fd);
-    }
-}
-
 static int rkmpp_afbc_rga_supported(int width, int height,
                                     int *has_rga2p)
 {
@@ -275,7 +239,6 @@ static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
     r->draining = 0;
     r->info_change = 0;
     r->got_frame = 0;
-    r->use_rfbc = 0;
     av_packet_unref(&r->last_pkt);
 
     if (r->mapi) {
@@ -308,7 +271,6 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
 {
     RKMPPDecContext *r = avctx->priv_data;
     MppCodingType coding_type = MPP_VIDEO_CodingUnused;
-    char soc_name[MAX_SOC_NAME_LENGTH];
     const char *opts_env = NULL;
     int ret, is_fmt_supported = 0;
     enum AVPixelFormat pix_fmts[3] = { AV_PIX_FMT_DRM_PRIME,
@@ -423,25 +385,17 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
     if (avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME)
         r->afbc = 0;
 
-    if (r->afbc > RKMPP_DEC_AFBC_OFF) {
-        read_soc_name(avctx, soc_name, sizeof(soc_name));
-        r->use_rfbc = !!strstr(soc_name, "rk3576");
-    }
-
     if (r->afbc == RKMPP_DEC_AFBC_ON_RGA) {
         int has_rga2p = 0;
 
         if (!rkmpp_afbc_rga_supported(avctx->width, avctx->height, &has_rga2p)) {
             av_log(avctx, AV_LOG_VERBOSE, "AFBC is requested without capable RGA, ignoring\n");
             r->afbc = RKMPP_DEC_AFBC_OFF;
-        } else {
-            r->use_rfbc = r->use_rfbc || has_rga2p;
         }
     }
 
     if (r->afbc) {
-        MppFrameFormat afbc_fmt = r->use_rfbc ? MPP_FRAME_FBC_RKFBC
-                                               : MPP_FRAME_FBC_AFBC_V2;
+        MppFrameFormat afbc_fmt = MPP_FRAME_FBC_AFBC_V2;
 
         if (avctx->codec_id == AV_CODEC_ID_H264 ||
             avctx->codec_id == AV_CODEC_ID_HEVC ||
@@ -715,7 +669,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     MppBuffer mpp_buf = NULL;
     MppFrameFormat mpp_fmt = MPP_FMT_BUTT;
     int mpp_frame_mode = 0;
-    int ret, is_fbc = 0, is_rfbc = 0;
+    int ret, is_fbc = 0;
 
     if (!frame || !mpp_frame) {
         ret = AVERROR(ENOMEM);
@@ -741,16 +695,21 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
 
     mpp_fmt = mpp_frame_get_fmt(mpp_frame);
     is_fbc  = mpp_fmt & MPP_FRAME_FBC_MASK;
-    is_rfbc = mpp_fmt & MPP_FRAME_FBC_RKFBC;
 
     desc->drm_desc.nb_layers = 1;
     layer = &desc->drm_desc.layers[0];
     layer->planes[0].object_index = 0;
 
     if (is_fbc) {
+        if (mpp_fmt & MPP_FRAME_FBC_RKFBC) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "RKFBC DRM export is not supported without an official DRM modifier\n");
+            ret = AVERROR(ENOSYS);
+            goto fail;
+        }
+
         desc->drm_desc.objects[0].format_modifier =
-            is_rfbc ? DRM_FORMAT_MOD_ROCKCHIP_RFBC(ROCKCHIP_RFBC_BLOCK_SIZE_64x4)
-                    : DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE | AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
+            DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE | AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
 
         layer->format = rkmpp_get_drm_afbc_format(mpp_fmt);
         layer->nb_planes = 1;
@@ -761,7 +720,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0)
             goto fail;
 
-        desc->afbc_offset_y = is_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
+        desc->afbc_offset_y = mpp_frame_get_offset_y(mpp_frame);
     } else {
         layer->format = rkmpp_get_drm_format(mpp_fmt);
         layer->nb_planes = 2;
