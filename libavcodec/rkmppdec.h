@@ -43,8 +43,6 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
-#define MAX_SOC_NAME_LENGTH 128
-
 typedef struct RKMPPDecContext {
     const AVClass *class;
 
@@ -62,7 +60,6 @@ typedef struct RKMPPDecContext {
     int            draining;
     int            info_change;
     int            got_frame;
-    int            use_rfbc;
     int            extradata_sent;
     int            frames_pending;
 
