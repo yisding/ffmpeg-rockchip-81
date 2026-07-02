@@ -426,6 +426,8 @@ static void mmap_free(struct video_data *s, int n)
     }
     av_freep(&s->buf_data);
     s->plane_count = 0;
+    s->buffers = 0;
+    atomic_store(&s->buffers_queued, 0);
 }
 
 static int mmap_init(AVFormatContext *ctx)
@@ -718,6 +720,8 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
             res = enqueue_buffer(s, &buf);
             return res ? res : AVERROR(EINVAL);
         }
+        if (s->raw_plane_count == 1 && bytesused > s->raw_plane_size[0])
+            bytesused = s->raw_plane_size[0];
     }
 
     if (bytesused > INT_MAX) {
@@ -891,7 +895,7 @@ static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
 
     s->raw_plane_count = 0;
 
-    if (!s->multiplanar || pix_fmt == AV_PIX_FMT_NONE)
+    if (pix_fmt == AV_PIX_FMT_NONE)
         return 0;
 
     nb_planes = av_pix_fmt_count_planes(pix_fmt);
@@ -912,6 +916,15 @@ static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
         ret = AVERROR(errno);
         av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_G_FMT): %s\n", av_err2str(ret));
         return ret;
+    }
+
+    if (!s->multiplanar) {
+        if (fmt.fmt.pix.bytesperline == linesizes[0] &&
+            fmt.fmt.pix.sizeimage >= s->frame_size) {
+            s->raw_plane_count = 1;
+            s->raw_plane_size[0] = s->frame_size;
+        }
+        return 0;
     }
 
     if (fmt.fmt.pix_mp.num_planes == 1) {
@@ -1313,19 +1326,20 @@ retry_setup:
     if ((res = validate_multiplanar_raw_layout(ctx, st->codecpar->format)) < 0)
         goto retry_or_fail;
 
+    if ((res = v4l2_set_parameters(ctx)) < 0)
+        goto fail;
+
+    if ((res = mmap_init(ctx)) < 0)
+        goto retry_mmap_or_fail;
+    if ((res = mmap_start(ctx)) < 0)
+        goto retry_mmap_or_fail;
+
     /* If no pixel_format was specified, the codec_id was not known up
      * until now. Set video_codec_id in the context, as codec_id will
      * not be available outside this function
      */
     if (codec_id != AV_CODEC_ID_NONE && ctx->video_codec_id == AV_CODEC_ID_NONE)
         ctx->video_codec_id = codec_id;
-
-    if ((res = v4l2_set_parameters(ctx)) < 0)
-        goto fail;
-
-    if ((res = mmap_init(ctx)) ||
-        (res = mmap_start(ctx)) < 0)
-            goto fail;
 
     s->top_field_first = first_field(s);
 
@@ -1347,6 +1361,10 @@ retry_setup:
         st->codecpar->bit_rate = s->frame_size * av_q2d(st->avg_frame_rate) * 8;
 
     return 0;
+
+retry_mmap_or_fail:
+    mmap_close(s);
+    goto retry_or_fail;
 
 retry_or_fail:
     if (s->multiplanar && s->has_capture && !tried_single_planar) {
