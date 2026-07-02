@@ -292,6 +292,43 @@ static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
     return 0;
 }
 
+static int get_afbc_min_size(const AVPixFmtDescriptor *desc,
+                             int pixel_stride,
+                             int height,
+                             int afbc_offset_y,
+                             uint64_t *min_size)
+{
+    uint64_t block_cols, block_rows, blocks;
+    uint64_t header_size, block_payload_size;
+    int bpp;
+
+    if (!desc || !min_size || pixel_stride <= 0 || height <= 0 ||
+        afbc_offset_y < 0)
+        return AVERROR(EINVAL);
+
+    bpp = av_get_padded_bits_per_pixel(desc);
+    if (bpp <= 0)
+        return AVERROR(EINVAL);
+
+    block_cols = ((uint64_t)pixel_stride + 15) >> 4;
+    block_rows = ((uint64_t)height + afbc_offset_y + 15) >> 4;
+    if (!block_cols || !block_rows || block_cols > UINT64_MAX / block_rows)
+        return AVERROR(EINVAL);
+
+    blocks = block_cols * block_rows;
+    if (blocks > (UINT64_MAX - 63) / 16)
+        return AVERROR(EINVAL);
+
+    header_size = (blocks * 16 + 63) & ~UINT64_C(63);
+    block_payload_size = ((uint64_t)bpp * 256 / 8 + 127) & ~UINT64_C(127);
+    if (!block_payload_size ||
+        blocks > (UINT64_MAX - header_size) / block_payload_size)
+        return AVERROR(EINVAL);
+
+    *min_size = header_size + blocks * block_payload_size;
+    return 0;
+}
+
 /* Canonical formats: https://dri.freedesktop.org/docs/drm/gpu/afbc.html */
 static uint32_t get_drm_afbc_format(enum AVPixelFormat pix_fmt)
 {
@@ -311,6 +348,12 @@ static uint32_t get_drm_afbc_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_BGR0:     return DRM_FORMAT_XRGB8888;
     default:                  return DRM_FORMAT_INVALID;
     }
+}
+
+static int rga_rotates_dimensions(int rotate_mode)
+{
+    return (rotate_mode & 0x04) == 0x04 || /* HAL_TRANSFORM_ROT_90 */
+           (rotate_mode & 0x07) == 0x07;  /* HAL_TRANSFORM_ROT_270 */
 }
 
 static uint32_t get_drm_linear_format(enum AVPixelFormat pix_fmt)
@@ -802,10 +845,16 @@ static int validate_linear_drm_layer(AVFilterContext *avctx,
 static int validate_afbc_drm_layer(AVFilterContext *avctx,
                                    const AVDRMObjectDescriptor *object,
                                    const AVDRMLayerDescriptor *layer,
-                                   enum AVPixelFormat pix_fmt)
+                                   const AVPixFmtDescriptor *pix_desc,
+                                   enum AVPixelFormat pix_fmt,
+                                   int height,
+                                   int afbc_offset_y)
 {
     const AVDRMPlaneDescriptor *plane;
     uint32_t drm_fbc_fmt = get_drm_afbc_format(pix_fmt);
+    uint64_t min_size;
+    int pixel_stride;
+    int ret;
 
     if (!object || !layer || !object->size || layer->nb_planes != 1) {
         av_log(avctx, AV_LOG_ERROR, "AFBC input must contain exactly one plane\n");
@@ -822,6 +871,25 @@ static int validate_afbc_drm_layer(AVFilterContext *avctx,
         av_log(avctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported\n",
                av_get_pix_fmt_name(pix_fmt));
         return AVERROR(ENOSYS);
+    }
+
+    ret = get_afbc_pixel_stride(pix_desc, plane->pitch, &pixel_stride);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid AFBC DRM plane pitch: %td\n",
+               plane->pitch);
+        return ret;
+    }
+
+    ret = get_afbc_min_size(pix_desc, pixel_stride, height,
+                            afbc_offset_y, &min_size);
+    if (ret < 0)
+        return ret;
+
+    if ((uint64_t)object->size < min_size) {
+        av_log(avctx, AV_LOG_ERROR,
+               "AFBC DRM object is too small: size=%"PRIu64" min=%"PRIu64"\n",
+               (uint64_t)object->size, min_size);
+        return AVERROR(EINVAL);
     }
 
     return 0;
@@ -1184,14 +1252,17 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     if (is_fbc) {
         int afbc_offset_y = 0;
 
-        ret = validate_afbc_drm_layer(ctx, object, layer, in_info->pix_fmt);
+        if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0)
+            afbc_offset_y = rkmpp_desc->afbc_offset_y;
+
+        ret = validate_afbc_drm_layer(ctx, object, layer,
+                                      in_info->pix_desc, in_info->pix_fmt,
+                                      inlink->h, afbc_offset_y);
         if (ret < 0)
             goto fail;
 
-        if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
-            afbc_offset_y = rkmpp_desc->afbc_offset_y;
+        if (afbc_offset_y > 0)
             info.rect.yoffset += afbc_offset_y;
-        }
 
         plane0 = &layer->planes[0];
         info.rect.wstride = plane0->pitch;
@@ -1638,6 +1709,7 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
     RKRGAContext *r = avctx->priv;
     float scale_ratio_min, scale_ratio_max;
     float scale_ratio_w, scale_ratio_h;
+    int scale_src_w, scale_src_h;
     int ret;
 
     if (!src || !dst)
@@ -1650,8 +1722,13 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return AVERROR(ENOSYS);
     }
 
-    scale_ratio_w = (float)dst->act_w / (float)src->act_w;
-    scale_ratio_h = (float)dst->act_h / (float)src->act_h;
+    scale_src_w = src->act_w;
+    scale_src_h = src->act_h;
+    if (rga_rotates_dimensions(src->rotate_mode))
+        FFSWAP(int, scale_src_w, scale_src_h);
+
+    scale_ratio_w = (float)dst->act_w / (float)scale_src_w;
+    scale_ratio_h = (float)dst->act_h / (float)scale_src_h;
 
     /* P010 requires RGA3 */
     if (!r->has_rga3 &&
@@ -1988,8 +2065,6 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     }
     if (avctx->nb_inputs > 1) {
         int need_premultiply = 0;
-
-        pat_info_for_verify = &r->in_rga_frame_infos[1];
 
         if (r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
             need_premultiply = param->in_alpha_format == 0;
