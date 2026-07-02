@@ -366,7 +366,7 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
     RKMPPEncContext *r = avctx->priv_data;
     MppEncCfg cfg = r->mcfg;
     MppFrameFormat mpp_fmt = r->mpp_fmt;
-    int ret, is_afbc = 0;
+    int ret, is_afbc = 0, is_rfbc = 0, is_fbc = 0;
     int hor_stride = 0, ver_stride = 0;
     const AVPixFmtDescriptor *pix_desc;
     const AVDRMFrameDescriptor *drm_desc;
@@ -386,19 +386,21 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
 
     pix_desc = av_pix_fmt_desc_get(r->pix_fmt);
     is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
-    if (!is_afbc &&
+    is_rfbc = drm_is_rfbc(drm_desc->objects[0].format_modifier);
+    is_fbc  = is_afbc || is_rfbc;
+    if (!is_fbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
+        av_log(avctx, AV_LOG_ERROR, "Only linear, AFBC and RFBC modifiers are supported\n");
         return AVERROR(ENOSYS);
     }
-    if (is_afbc &&
+    if (is_fbc &&
         !(avctx->codec_id == AV_CODEC_ID_H264 ||
           avctx->codec_id == AV_CODEC_ID_HEVC)) {
-        av_log(avctx, AV_LOG_ERROR, "AFBC is not supported in codec '%s'\n",
+        av_log(avctx, AV_LOG_ERROR, "FBC is not supported in codec '%s'\n",
                avcodec_get_name(avctx->codec_id));
         return AVERROR(ENOSYS);
     }
-    if (!is_afbc) {
+    if (!is_fbc) {
         ret = get_byte_stride(&drm_desc->objects[0],
                               &drm_desc->layers[0],
                               (pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
@@ -437,16 +439,16 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         mpp_enc_cfg_set_s32(cfg, "prep:format_out", rkmpp_fix_chroma_fmt(r->chroma_fmt, r->pix_fmt));
     }
 
-    if (is_afbc) {
+    if (is_fbc) {
         const AVDRMLayerDescriptor *layer = &drm_desc->layers[0];
-        uint32_t drm_afbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
+        uint32_t drm_fbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
 
-        if (drm_afbc_fmt != layer->format) {
-            av_log(avctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported\n",
+        if (drm_fbc_fmt != layer->format) {
+            av_log(avctx, AV_LOG_ERROR, "Input format '%s' with FBC modifier is not supported\n",
                    av_get_pix_fmt_name(r->pix_fmt));
             return AVERROR(ENOSYS);
         }
-        mpp_fmt |= MPP_FRAME_FBC_AFBC_V2;
+        mpp_fmt |= is_rfbc ? MPP_FRAME_FBC_RKFBC : MPP_FRAME_FBC_AFBC_V2;
     }
     mpp_enc_cfg_set_s32(cfg, "prep:format", mpp_fmt);
 
@@ -815,7 +817,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     int hor_stride = 0, ver_stride = 0;
     MppBufferInfo buf_info = { 0 };
     MppFrameFormat mpp_fmt = r->mpp_fmt;
-    int ret, is_afbc = 0;
+    int ret, is_afbc = 0, is_rfbc = 0, is_fbc = 0;
 
     MPPEncFrame *mpp_enc_frame = NULL;
 
@@ -927,40 +929,42 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     plane0 = &layer->planes[0];
 
     is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
-    if (!is_afbc &&
+    is_rfbc = drm_is_rfbc(drm_desc->objects[0].format_modifier);
+    is_fbc  = is_afbc || is_rfbc;
+    if (!is_fbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
+        av_log(avctx, AV_LOG_ERROR, "Only linear, AFBC and RFBC modifiers are supported\n");
         *errp = AVERROR(EINVAL);
         goto exit;
     }
-    if (is_afbc &&
+    if (is_fbc &&
         !(avctx->codec_id == AV_CODEC_ID_H264 ||
           avctx->codec_id == AV_CODEC_ID_HEVC)) {
-        av_log(avctx, AV_LOG_ERROR, "AFBC is not supported in codec '%s'\n",
+        av_log(avctx, AV_LOG_ERROR, "FBC is not supported in codec '%s'\n",
                avcodec_get_name(avctx->codec_id));
         *errp = AVERROR(EINVAL);
         goto exit;
     }
-    if (is_afbc) {
-        uint32_t drm_afbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
+    if (is_fbc) {
+        uint32_t drm_fbc_fmt = rkmpp_get_drm_afbc_format(mpp_fmt);
         int afbc_offset_y = 0;
 
-        if (drm_afbc_fmt != layer->format) {
-            av_log(avctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported\n",
+        if (drm_fbc_fmt != layer->format) {
+            av_log(avctx, AV_LOG_ERROR, "Input format '%s' with FBC modifier is not supported\n",
                    av_get_pix_fmt_name(r->pix_fmt));
             *errp = AVERROR(EINVAL);
             goto exit;
         }
-        mpp_fmt |= MPP_FRAME_FBC_AFBC_V2;
+        mpp_fmt |= is_rfbc ? MPP_FRAME_FBC_RKFBC : MPP_FRAME_FBC_AFBC_V2;
 
-        if (rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
+        if (!is_rfbc && rkmpp_desc && rkmpp_desc->afbc_offset_y > 0) {
             afbc_offset_y = rkmpp_desc->afbc_offset_y;
             mpp_frame_set_offset_y(mpp_frame, afbc_offset_y);
         }
     }
     mpp_frame_set_fmt(mpp_frame, mpp_fmt);
 
-    if (is_afbc) {
+    if (is_fbc) {
         hor_stride = plane0->pitch;
         if ((ret = get_afbc_byte_stride(pix_desc, &hor_stride, 1)) < 0) {
             *errp = ret;
