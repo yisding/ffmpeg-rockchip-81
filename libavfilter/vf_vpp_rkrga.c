@@ -196,6 +196,7 @@ static av_cold int set_size_info(AVFilterContext *ctx,
 {
     RGAVppContext *r = ctx->priv;
     int w, h, ret;
+    int src_w, src_h;
 
     if (inlink->w < 2 || inlink->w > 8192 ||
         inlink->h < 2 || inlink->h > 8192) {
@@ -215,6 +216,8 @@ static av_cold int set_size_info(AVFilterContext *ctx,
     r->act_y = FFMIN(r->act_y, inlink->h - r->act_h);
     r->act_w = FFMIN(r->act_w, inlink->w - r->act_x);
     r->act_h = FFMIN(r->act_h, inlink->h - r->act_y);
+    src_w = r->act_w;
+    src_h = r->act_h;
 
     ret = ff_scale_adjust_dimensions(inlink, &w, &h,
                                      r->force_original_aspect_ratio,
@@ -222,8 +225,8 @@ static av_cold int set_size_info(AVFilterContext *ctx,
     if (ret < 0)
         return ret;
 
-    if (((int64_t)h * inlink->w) > INT_MAX ||
-        ((int64_t)w * inlink->h) > INT_MAX) {
+    if (((int64_t)h * src_w) > INT_MAX ||
+        ((int64_t)w * src_h) > INT_MAX) {
         av_log(ctx, AV_LOG_ERROR, "Rescaled value for width or height is too big.\n");
         return AVERROR(EINVAL);
     }
@@ -237,8 +240,8 @@ static av_cold int set_size_info(AVFilterContext *ctx,
     }
 
     if (inlink->sample_aspect_ratio.num)
-        outlink->sample_aspect_ratio = av_mul_q((AVRational){outlink->h * inlink->w,
-                                                             outlink->w * inlink->h},
+        outlink->sample_aspect_ratio = av_mul_q((AVRational){outlink->h * src_w,
+                                                             outlink->w * src_h},
                                                 inlink->sample_aspect_ratio);
     else
         outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;

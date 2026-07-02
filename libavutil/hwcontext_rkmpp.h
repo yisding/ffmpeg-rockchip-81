@@ -112,6 +112,12 @@ typedef struct AVRKMPPDRMFrameDescriptor {
      * on each drm frame index.
      */
     MppBuffer buffers[AV_DRM_MAX_PLANES];
+
+    /**
+     * RKMPP AFBC source Y offset. This is hardware layout metadata, not
+     * presentation cropping.
+     */
+    int afbc_offset_y;
 } AVRKMPPDRMFrameDescriptor;
 
 /**

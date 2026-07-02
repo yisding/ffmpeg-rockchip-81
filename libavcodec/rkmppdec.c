@@ -759,8 +759,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0)
             goto fail;
 
-        /* MPP specific AFBC src_y offset, not memory address offset */
-        frame->crop_top = r->use_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
+        desc->afbc_offset_y = r->use_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
     } else {
         layer->format = rkmpp_get_drm_format(mpp_fmt);
         layer->nb_planes = 2;

@@ -28,6 +28,41 @@
 #include "pixdesc.h"
 #include "intreadwrite.h"
 
+static unsigned read_bitstream_lsb(const uint8_t *data, int bit_offset,
+                                   int depth)
+{
+    uint64_t val = 0;
+    int byte_offset = bit_offset >> 3;
+    int shift = bit_offset & 7;
+    int bits = shift + depth;
+    unsigned mask = depth == 32 ? UINT32_MAX : (1U << depth) - 1;
+
+    for (int i = 0; i < (bits + 7) >> 3; i++)
+        val |= (uint64_t)data[byte_offset + i] << (8 * i);
+
+    return (val >> shift) & mask;
+}
+
+static void write_bitstream_lsb(uint8_t *data, int bit_offset,
+                                int depth, unsigned val)
+{
+    int byte_offset = bit_offset >> 3;
+    int shift = bit_offset & 7;
+    int bits = shift + depth;
+    unsigned mask = depth == 32 ? UINT32_MAX : (1U << depth) - 1;
+    uint64_t field_mask = (uint64_t)mask << shift;
+    uint64_t word = 0;
+
+    val &= mask;
+    for (int i = 0; i < (bits + 7) >> 3; i++)
+        word |= (uint64_t)data[byte_offset + i] << (8 * i);
+
+    word = (word & ~field_mask) | ((uint64_t)val << shift);
+
+    for (int i = 0; i < (bits + 7) >> 3; i++)
+        data[byte_offset + i] = word >> (8 * i);
+}
+
 void av_read_image_line2(void *dst,
                         const uint8_t *data[4], const int linesize[4],
                         const AVPixFmtDescriptor *desc,
@@ -50,18 +85,22 @@ void av_read_image_line2(void *dst,
 
     if (flags & AV_PIX_FMT_FLAG_BITSTREAM) {
         if (step > 8) {
-            // Assume all channels are packed into a 32bit value
-            const uint8_t *byte_p = data[plane] + y * linesize[plane];
-            const uint32_t *p = (uint32_t *)byte_p;
+            const uint8_t *p = data[plane] + y * linesize[plane];
+            int bit_offset = x * step + comp.offset;
 
             while (w--) {
-                int val = AV_RB32(p);
-                val = (val >> comp.offset) & mask;
+                int val;
+                if (flags & AV_PIX_FMT_FLAG_BE) {
+                    const uint8_t *src = p + ((bit_offset - comp.offset) >> 3);
+                    val = (AV_RB32(src) >> comp.offset) & mask;
+                } else {
+                    val = read_bitstream_lsb(p, bit_offset, depth);
+                }
                 if (read_pal_component)
                     val = data[1][4*val + c];
                 if (dst_element_size == 4) *dst32++ = val;
                 else                       *dst16++ = val;
-                p++;
+                bit_offset += step;
             }
         } else {
             int skip = x * step + comp.offset;
@@ -132,16 +171,19 @@ void av_write_image_line2(const void *src,
 
     if (flags & AV_PIX_FMT_FLAG_BITSTREAM) {
         if (step > 8) {
-            // Assume all channels are packed into a 32bit value
-            const uint8_t *byte_p = data[plane] + y * linesize[plane];
-            uint32_t *p = (uint32_t *)byte_p;
-            int offset = comp.offset;
-            uint32_t mask  = ((1ULL << depth) - 1) << offset;
+            uint8_t *p = data[plane] + y * linesize[plane];
+            int bit_offset = x * step + comp.offset;
 
             while (w--) {
                 unsigned val = src_element_size == 4 ? *src32++ : *src16++;
-                AV_WB32(p, (AV_RB32(p) & ~mask) | (val << offset));
-                p++;
+                if (flags & AV_PIX_FMT_FLAG_BE) {
+                    uint8_t *dst = p + ((bit_offset - comp.offset) >> 3);
+                    uint32_t mask = ((1ULL << depth) - 1) << comp.offset;
+                    AV_WB32(dst, (AV_RB32(dst) & ~mask) | (val << comp.offset));
+                } else {
+                    write_bitstream_lsb(p, bit_offset, depth, val);
+                }
+                bit_offset += step;
             }
         } else {
             int skip = x * step + comp.offset;
