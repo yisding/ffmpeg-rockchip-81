@@ -77,10 +77,6 @@
         DRM_FORMAT_MOD_ARM_CODE(DRM_FORMAT_MOD_ARM_TYPE_AFBC, __afbc_mode)
 #endif
 
-#define drm_is_afbc(mod) \
-        (((mod) >> 52) == (DRM_FORMAT_MOD_ARM_TYPE_AFBC | \
-                (DRM_FORMAT_MOD_VENDOR_ARM << 4)))
-
 /**
  * DRM Prime Frame descriptor for RKMPP HWDevice.
  */

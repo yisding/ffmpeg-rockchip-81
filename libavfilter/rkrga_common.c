@@ -24,6 +24,7 @@
  */
 
 #include <inttypes.h>
+#include <limits.h>
 
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
@@ -237,14 +238,50 @@ static const AVDRMObjectDescriptor *get_single_drm_object(const AVDRMFrameDescri
     return object_index < 0 ? NULL : &desc->objects[object_index];
 }
 
-static int get_afbc_pixel_stride(float bytes_pp, int *stride, int reverse)
+static int get_afbc_pixel_stride(const AVPixFmtDescriptor *desc,
+                                 ptrdiff_t byte_stride,
+                                 int *pixel_stride)
 {
-    if (!stride || *stride <= 0 || bytes_pp <= 0)
+    int bpp;
+    int64_t bits;
+
+    if (!desc || !pixel_stride || byte_stride <= 0)
         return AVERROR(EINVAL);
 
-    *stride = reverse ? (*stride / bytes_pp) : (*stride * bytes_pp);
+    bpp = av_get_padded_bits_per_pixel(desc);
+    bits = (int64_t)byte_stride * 8;
+    if (bpp <= 0 || bits % bpp)
+        return AVERROR(EINVAL);
 
-    return (*stride > 0) ? 0 : AVERROR(EINVAL);
+    bits /= bpp;
+    if (bits <= 0 || bits > INT_MAX)
+        return AVERROR(EINVAL);
+
+    *pixel_stride = bits;
+    return 0;
+}
+
+static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
+                                int pixel_stride,
+                                ptrdiff_t *byte_stride)
+{
+    int bpp;
+    int64_t bits;
+
+    if (!desc || !byte_stride || pixel_stride <= 0)
+        return AVERROR(EINVAL);
+
+    bpp = av_get_padded_bits_per_pixel(desc);
+    bits = (int64_t)pixel_stride * bpp;
+    if (bpp <= 0 || bits % 8)
+        return AVERROR(EINVAL);
+
+    bits /= 8;
+    if (bits <= 0 || bits > PTRDIFF_MAX)
+        return AVERROR(EINVAL);
+
+    *byte_stride = bits;
+    return 0;
 }
 
 /* Canonical formats: https://dri.freedesktop.org/docs/drm/gpu/afbc.html */
@@ -997,11 +1034,12 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 
         plane0 = &layer->planes[0];
         info.rect.wstride = plane0->pitch;
-        if ((ret = get_afbc_pixel_stride(in_info->bytes_pp, &info.rect.wstride, 1)) < 0)
+        if ((ret = get_afbc_pixel_stride(in_info->pix_desc, plane0->pitch,
+                                         &info.rect.wstride)) < 0)
             goto fail;
 
         if (info.rect.wstride % RK_RGA_AFBC_16x16_STRIDE_ALIGN)
-            info.rect.wstride = FFALIGN(inlink->w, RK_RGA_AFBC_16x16_STRIDE_ALIGN);
+            goto fail;
 
         info.rect.hstride = FFALIGN(inlink->h + afbc_offset_y,
                                     RK_RGA_AFBC_16x16_STRIDE_ALIGN);
@@ -1010,6 +1048,18 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
                                           info.rect.wstride,
                                           info.rect.hstride, "Input");
         if (ret < 0)
+            goto fail;
+        ret = validate_rga3_pixel_stride(ctx, in_info, out_info,
+                                         info.rect.wstride,
+                                         info.rect.hstride, "Input");
+        if (ret < 0)
+            goto fail;
+        if (ret > 0 && !r->has_rga2p) {
+            av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported by RGA2 (non-Pro)\n",
+                   av_get_pix_fmt_name(in_info->pix_fmt));
+            goto fail;
+        }
+        if ((ret = verify_rga_frame_info_io_dynamic(ctx, in_info, out_info)) < 0)
             goto fail;
 
         info.rd_mode = 1 << 1; /* IM_AFBC16x16_MODE */
@@ -1122,22 +1172,66 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     }
 
     is_afbc = r->afbc_out && !pat_preproc;
+    if (is_afbc) {
+        uint32_t drm_afbc_fmt = get_drm_afbc_format(out_info->pix_fmt);
+        int afbc_w_stride = FFALIGN(pat_preproc ? inlink->w : outlink->w,
+                                    RK_RGA_AFBC_16x16_STRIDE_ALIGN);
+        int afbc_h_stride = FFALIGN(pat_preproc ? inlink->h : outlink->h,
+                                    RK_RGA_AFBC_16x16_STRIDE_ALIGN);
+
+        if (drm_afbc_fmt == DRM_FORMAT_INVALID) {
+            av_log(ctx, AV_LOG_WARNING, "Output format '%s' with AFBC modifier is not supported\n",
+                   av_get_pix_fmt_name(out_info->pix_fmt));
+            is_afbc = r->afbc_out = 0;
+        } else if ((out_info->rga_fmt == RK_FORMAT_YCbCr_420_SP_10B ||
+                    out_info->rga_fmt == RK_FORMAT_YCbCr_422_SP_10B) &&
+                   (afbc_w_stride % 64)) {
+            av_log(ctx, AV_LOG_WARNING, "Output pixel wstride '%d' format '%s' is not supported by RGA3 AFBC\n",
+                   afbc_w_stride, av_get_pix_fmt_name(out_info->pix_fmt));
+            is_afbc = r->afbc_out = 0;
+        } else {
+            w_stride = afbc_w_stride;
+            h_stride = afbc_h_stride;
+        }
+    }
+
     ret = validate_linear_drm_layer(ctx, object, layer, out_info->pix_fmt,
                                     outlink->w, outlink->h);
     if (ret < 0)
         goto fail;
-    ret = get_pixel_stride(object,
-                           layer,
-                           out_info->pix_fmt,
-                           (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
-                           (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                           outlink->w, outlink->h, &w_stride, &h_stride);
-    if (!is_afbc && (ret < 0 || !w_stride || !h_stride)) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
-        goto fail;
+    if (!is_afbc) {
+        ret = get_pixel_stride(object,
+                               layer,
+                               out_info->pix_fmt,
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
+                               outlink->w, outlink->h, &w_stride, &h_stride);
+        if (ret < 0 || !w_stride || !h_stride) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
+            goto fail;
+        }
     }
 
-    if (!is_afbc) {
+    ret = validate_active_rect_stride(ctx, out_info,
+                                      w_stride, h_stride, "Output");
+    if (ret < 0)
+        goto fail;
+    ret = validate_rga3_pixel_stride(ctx, out_info, &r->out_rga_frame_info,
+                                     w_stride, h_stride, "Output");
+    if (ret < 0)
+        goto fail;
+    if (ret > 0 && is_afbc) {
+        is_afbc = r->afbc_out = 0;
+        ret = get_pixel_stride(object,
+                               layer,
+                               out_info->pix_fmt,
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
+                               outlink->w, outlink->h, &w_stride, &h_stride);
+        if (ret < 0 || !w_stride || !h_stride) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
+            goto fail;
+        }
         ret = validate_active_rect_stride(ctx, out_info,
                                           w_stride, h_stride, "Output");
         if (ret < 0)
@@ -1146,11 +1240,11 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                          w_stride, h_stride, "Output");
         if (ret < 0)
             goto fail;
-        if ((ret = verify_rga_frame_info_io_dynamic(ctx,
-                                                    pat_preproc ? in1_info : in0_info,
-                                                    out_info)) < 0)
-            goto fail;
     }
+    if ((ret = verify_rga_frame_info_io_dynamic(ctx,
+                                                pat_preproc ? in1_info : in0_info,
+                                                out_info)) < 0)
+        goto fail;
 
     info.fd           = object->fd;
     info.format       = out_info->rga_fmt;
@@ -1205,24 +1299,6 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     if (is_afbc) {
         uint32_t drm_afbc_fmt = get_drm_afbc_format(out_info->pix_fmt);
 
-        if (drm_afbc_fmt == DRM_FORMAT_INVALID) {
-            av_log(ctx, AV_LOG_WARNING, "Output format '%s' with AFBC modifier is not supported\n",
-                   av_get_pix_fmt_name(out_info->pix_fmt));
-            r->afbc_out = 0;
-            goto exit;
-        }
-
-        w_stride = FFALIGN(pat_preproc ? inlink->w : outlink->w, RK_RGA_AFBC_16x16_STRIDE_ALIGN);
-        h_stride = FFALIGN(pat_preproc ? inlink->h : outlink->h, RK_RGA_AFBC_16x16_STRIDE_ALIGN);
-
-        if ((info.rect.format == RK_FORMAT_YCbCr_420_SP_10B ||
-             info.rect.format == RK_FORMAT_YCbCr_422_SP_10B) && (w_stride % 64)) {
-            av_log(ctx, AV_LOG_WARNING, "Output pixel wstride '%d' format '%s' is not supported by RGA3 AFBC\n",
-                   w_stride, av_get_pix_fmt_name(out_info->pix_fmt));
-            r->afbc_out = 0;
-            goto exit;
-        }
-
 #ifndef RGA_NORMAL_FBCE_RGB_BGR_FIXUP
         /* Inverted RGB/BGR order in FBCE */
         switch (info.rect.format) {
@@ -1248,11 +1324,11 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         layer->planes[0].offset = 0;
         layer->planes[0].pitch  = info.rect.wstride;
 
-        if ((ret = get_afbc_pixel_stride(out_info->bytes_pp, (int *)&layer->planes[0].pitch, 0)) < 0)
+        if ((ret = get_afbc_byte_stride(out_info->pix_desc, info.rect.wstride,
+                                        &layer->planes[0].pitch)) < 0)
             goto fail;
     }
 
-exit:
     out_frame->info = info;
 
     return out_frame;
@@ -1598,8 +1674,6 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
 
     info->pix_fmt  = hwfc->sw_format;
     info->pix_desc = av_pix_fmt_desc_get(info->pix_fmt);
-    info->bytes_pp = av_get_padded_bits_per_pixel(info->pix_desc) / 8.0f;
-
     info->act_x    = 0;
     info->act_y    = 0;
     info->act_w    = link->w;
