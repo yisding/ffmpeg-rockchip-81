@@ -26,7 +26,6 @@
 #ifndef AVFILTER_RKRGA_COMMON_H
 #define AVFILTER_RKRGA_COMMON_H
 
-#include <rga/RgaApi.h>
 #include <rga/im2d.h>
 
 #include "avfilter.h"
@@ -41,9 +40,19 @@
 #define FF_INLINK_IDX(link)  ((int)((link)->dstpad - (link)->dst->input_pads))
 #define FF_OUTLINK_IDX(link) ((int)((link)->srcpad - (link)->src->output_pads))
 
+typedef struct RGAImage {
+    rga_buffer_t      buf;
+    im_rect          rect;
+    int              usage;
+    int              sync_mode;
+    int              out_fence_fd;
+    int              core;
+    int              priority;
+} RGAImage;
+
 typedef struct RGAFrame {
     AVFrame          *frame;
-    rga_info_t        info;
+    RGAImage          image;
     struct RGAFrame  *next;
     int               queued;
     int               locked;
@@ -59,7 +68,9 @@ typedef struct RGAFrameInfo {
     int                       act_h;
     int                       uncompact_10b_msb;
     int                       rotate_mode;
-    int                       blend_mode;
+    int                       blend_usage;
+    int                       src_global_alpha;
+    int                       dst_global_alpha;
     int                       crop;
     int                       scheduler_core;
     int                       overlay_x;
