@@ -62,8 +62,8 @@ typedef struct RGAFormatMap {
     { AV_PIX_FMT_NV16,     RK_FORMAT_YCbCr_422_SP }, \
     { AV_PIX_FMT_NV24,     RK_FORMAT_YCbCr_444_SP },     /* RGA2-Pro only */ \
     { AV_PIX_FMT_NV42,     RK_FORMAT_YCrCb_444_SP },     /* RGA2-Pro only */ \
-    { AV_PIX_FMT_P010,     RK_FORMAT_YCbCr_420_SP_10B }, /* RGA3 only */ \
-    { AV_PIX_FMT_P210,     RK_FORMAT_YCbCr_422_SP_10B }, /* RGA3 only */ \
+    { AV_PIX_FMT_P010,     RK_FORMAT_P010 },             /* RGA3 only */ \
+    { AV_PIX_FMT_P210,     RK_FORMAT_P210 },             /* RGA3 only */ \
     { AV_PIX_FMT_NV15,     RK_FORMAT_YCbCr_420_SP_10B }, /* RGA2 only input, aka P010 compact */ \
     { AV_PIX_FMT_NV20_PACKED, RK_FORMAT_YCbCr_422_SP_10B }, /* RGA2 only input, aka P210 compact */ \
     { AV_PIX_FMT_YUYV422,  RK_FORMAT_YUYV_422 }, \
@@ -356,6 +356,57 @@ static int rga_rotates_dimensions(int rotate_mode)
            (rotate_mode & 0x07) == 0x07;  /* HAL_TRANSFORM_ROT_270 */
 }
 
+static void set_im_rect(im_rect *rect, int x, int y, int w, int h)
+{
+    rect->x      = x;
+    rect->y      = y;
+    rect->width  = w;
+    rect->height = h;
+}
+
+static int legacy_transform_to_im2d_usage(AVFilterContext *avctx,
+                                          int rotate_mode, int *usage)
+{
+    if (!usage)
+        return AVERROR(EINVAL);
+
+    switch (rotate_mode) {
+    case 0:
+        *usage = 0;
+        break;
+    case 0x01: /* HAL_TRANSFORM_FLIP_H */
+        *usage = IM_HAL_TRANSFORM_FLIP_H;
+        break;
+    case 0x02: /* HAL_TRANSFORM_FLIP_V */
+        *usage = IM_HAL_TRANSFORM_FLIP_V;
+        break;
+    case 0x03: /* HAL_TRANSFORM_ROT_180 */
+        *usage = IM_HAL_TRANSFORM_ROT_180;
+        break;
+    case 0x04: /* HAL_TRANSFORM_ROT_90 */
+        *usage = IM_HAL_TRANSFORM_ROT_90;
+        break;
+    case 0x05: /* HAL_TRANSFORM_ROT_90 + HAL_TRANSFORM_FLIP_H */
+        *usage = IM_HAL_TRANSFORM_ROT_90 | IM_HAL_TRANSFORM_FLIP_H;
+        break;
+    case 0x06: /* HAL_TRANSFORM_ROT_270 + HAL_TRANSFORM_FLIP_H */
+        *usage = IM_HAL_TRANSFORM_ROT_270 | IM_HAL_TRANSFORM_FLIP_H;
+        break;
+    case 0x07: /* HAL_TRANSFORM_ROT_270 */
+        *usage = IM_HAL_TRANSFORM_ROT_270;
+        break;
+    case 0x08: /* HAL_TRANSFORM_FLIP_H_V */
+        *usage = IM_HAL_TRANSFORM_FLIP_H_V;
+        break;
+    default:
+        av_log(avctx, AV_LOG_ERROR, "Unsupported RGA transform mode: 0x%x\n",
+               rotate_mode);
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
 static uint32_t get_drm_linear_format(enum AVPixelFormat pix_fmt)
 {
     switch (pix_fmt) {
@@ -499,7 +550,9 @@ static int is_pixel_stride_rga3_compat(int ws, int hs,
     case RK_FORMAT_YCrCb_420_SP:
     case RK_FORMAT_YCbCr_422_SP:     return !(ws % 16) && !(hs % 2);
     case RK_FORMAT_YCbCr_420_SP_10B:
-    case RK_FORMAT_YCbCr_422_SP_10B: return !(ws % 64) && !(hs % 2);
+    case RK_FORMAT_YCbCr_422_SP_10B:
+    case RK_FORMAT_P010:
+    case RK_FORMAT_P210:             return !(ws % 64) && !(hs % 2);
     case RK_FORMAT_YUYV_422:
     case RK_FORMAT_YVYU_422:
     case RK_FORMAT_UYVY_422:         return !(ws % 8) && !(hs % 2);
@@ -1150,11 +1203,12 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 {
     RGAFrame        *rga_frame;
     AVFilterContext *ctx = inlink->dst;
-    rga_info_t info = { .mmuFlag = 1, };
+    RGAImage image = { 0 };
     int nb_link = FF_INLINK_IDX(inlink);
     RGAFrameInfo *in_info = &r->in_rga_frame_infos[nb_link];
     RGAFrameInfo *out_info = &r->out_rga_frame_info;
     int w_stride = 0, h_stride = 0;
+    int rect_x = 0, rect_y = 0, rect_w = 0, rect_h = 0;
     const AVRKMPPDRMFrameDescriptor *rkmpp_desc = NULL;
     const AVDRMFrameDescriptor *desc;
     const AVDRMObjectDescriptor *object;
@@ -1162,6 +1216,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     const AVDRMPlaneDescriptor *plane0;
     RGAFrame **frame_list = NULL;
     int is_afbc = 0;
+    int rd_mode = IM_RASTER_MODE;
     int ret, is_fbc = 0;
 
     if (pat_preproc && !nb_link)
@@ -1220,17 +1275,13 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         }
     }
 
-    info.fd           = object->fd;
-    info.format       = in_info->rga_fmt;
-    info.in_fence_fd  = -1;
-    info.out_fence_fd = -1;
-
-    if (in_info->uncompact_10b_msb)
-        info.is_10b_compact = info.is_10b_endian = 1;
-
     if (!nb_link) {
-        info.rotation = in_info->rotate_mode;
-        info.blend    = (do_overlay && !pat_preproc) ? in_info->blend_mode : 0;
+        ret = legacy_transform_to_im2d_usage(ctx, in_info->rotate_mode,
+                                             &image.usage);
+        if (ret < 0)
+            goto fail;
+        if (do_overlay && !pat_preproc)
+            image.usage |= in_info->blend_usage;
     }
 
     if (!is_fbc && is_linear_rga2_only_input_format(in_info->pix_fmt) &&
@@ -1266,14 +1317,16 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 
     if (pat_preproc) {
         RGAFrameInfo *in0_info = &r->in_rga_frame_infos[0];
-        rga_set_rect(&info.rect, 0, 0,
-                     FFMIN((in0_info->act_w - in_info->overlay_x), in_info->act_w),
-                     FFMIN((in0_info->act_h - in_info->overlay_y), in_info->act_h),
-                     w_stride, h_stride, in_info->rga_fmt);
-    } else
-        rga_set_rect(&info.rect, in_info->act_x, in_info->act_y,
-                     in_info->act_w, in_info->act_h,
-                     w_stride, h_stride, in_info->rga_fmt);
+        rect_x = 0;
+        rect_y = 0;
+        rect_w = FFMIN((in0_info->act_w - in_info->overlay_x), in_info->act_w);
+        rect_h = FFMIN((in0_info->act_h - in_info->overlay_y), in_info->act_h);
+    } else {
+        rect_x = in_info->act_x;
+        rect_y = in_info->act_y;
+        rect_w = in_info->act_w;
+        rect_h = in_info->act_h;
+    }
 
     if (is_fbc) {
         int afbc_offset_y = 0;
@@ -1288,28 +1341,26 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
             goto fail;
 
         if (afbc_offset_y > 0)
-            info.rect.yoffset += afbc_offset_y;
+            rect_y += afbc_offset_y;
 
         plane0 = &layer->planes[0];
-        info.rect.wstride = plane0->pitch;
+        w_stride = plane0->pitch;
         if ((ret = get_afbc_pixel_stride(in_info->pix_desc, plane0->pitch,
-                                         &info.rect.wstride)) < 0)
+                                         &w_stride)) < 0)
             goto fail;
 
-        if (info.rect.wstride % RK_RGA_AFBC_16x16_STRIDE_ALIGN)
+        if (w_stride % RK_RGA_AFBC_16x16_STRIDE_ALIGN)
             goto fail;
 
-        info.rect.hstride = FFALIGN(inlink->h + afbc_offset_y,
-                                    RK_RGA_AFBC_16x16_STRIDE_ALIGN);
+        h_stride = FFALIGN(inlink->h + afbc_offset_y,
+                           RK_RGA_AFBC_16x16_STRIDE_ALIGN);
 
         ret = validate_active_rect_stride(ctx, in_info,
-                                          info.rect.wstride,
-                                          info.rect.hstride, "Input");
+                                          w_stride, h_stride, "Input");
         if (ret < 0)
             goto fail;
         ret = validate_rga3_pixel_stride(ctx, in_info, out_info,
-                                         info.rect.wstride,
-                                         info.rect.hstride, "Input");
+                                         w_stride, h_stride, "Input");
         if (ret < 0)
             goto fail;
         if (ret > 0 && !r->has_rga2p) {
@@ -1320,10 +1371,19 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         if ((ret = verify_rga_frame_info_io_dynamic(ctx, in_info, out_info)) < 0)
             goto fail;
 
-        info.rd_mode = 1 << 1; /* IM_AFBC16x16_MODE */
+        rd_mode = IM_AFBC16x16_MODE;
     }
 
-    rga_frame->info = info;
+    image.buf = wrapbuffer_fd_t(object->fd, inlink->w, inlink->h,
+                                w_stride, h_stride, in_info->rga_fmt);
+    image.buf.rd_mode = rd_mode;
+    if (!nb_link && do_overlay && !pat_preproc)
+        image.buf.global_alpha = in_info->src_global_alpha;
+    image.sync_mode = IM_SYNC;
+    image.out_fence_fd = -1;
+    set_im_rect(&image.rect, rect_x, rect_y, rect_w, rect_h);
+
+    rga_frame->image = image;
 
     return rga_frame;
 
@@ -1338,7 +1398,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     AVFilterContext *ctx = outlink->src;
     AVFilterLink *inlink = ctx->inputs[0];
     RGAFrame        *out_frame;
-    rga_info_t info = { .mmuFlag = 1, };
+    RGAImage image = { 0 };
     RGAFrameInfo *in0_info = &r->in_rga_frame_infos[0];
     RGAFrameInfo *in1_info = ctx->nb_inputs > 1 ? &r->in_rga_frame_infos[1] : NULL;
     RGAFrameInfo *out_info = pat_preproc ? in1_info : &r->out_rga_frame_info;
@@ -1348,10 +1408,14 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     int w_stride = 0, h_stride = 0;
     int act_w, act_h;
     int frame_w, frame_h;
+    int rect_x, rect_y;
+    int color_space_mode = IM_COLOR_SPACE_DEFAULT;
+    int rga_fmt;
     AVDRMFrameDescriptor *desc;
     AVDRMLayerDescriptor *layer;
     AVDRMObjectDescriptor *object;
     RGAFrame **frame_list = NULL;
+    int rd_mode = IM_RASTER_MODE;
     int ret, is_afbc = 0, object_index;
 
     if (!out_info || !hw_frame_ctx)
@@ -1463,7 +1527,9 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                    av_get_pix_fmt_name(out_info->pix_fmt));
             is_afbc = r->afbc_out = 0;
         } else if ((out_info->rga_fmt == RK_FORMAT_YCbCr_420_SP_10B ||
-                    out_info->rga_fmt == RK_FORMAT_YCbCr_422_SP_10B) &&
+                    out_info->rga_fmt == RK_FORMAT_YCbCr_422_SP_10B ||
+                    out_info->rga_fmt == RK_FORMAT_P010 ||
+                    out_info->rga_fmt == RK_FORMAT_P210) &&
                    (afbc_w_stride % 64)) {
             av_log(ctx, AV_LOG_WARNING, "Output pixel wstride '%d' format '%s' is not supported by RGA3 AFBC\n",
                    afbc_w_stride, av_get_pix_fmt_name(out_info->pix_fmt));
@@ -1525,74 +1591,57 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                                 &validate_out_info)) < 0)
         goto fail;
 
-    info.fd           = object->fd;
-    info.format       = out_info->rga_fmt;
-    info.core         = out_info->scheduler_core;
-    info.in_fence_fd  = -1;
-    info.out_fence_fd = -1;
-    info.sync_mode    = RGA_BLIT_ASYNC;
-
-    if (out_info->uncompact_10b_msb)
-        info.is_10b_compact = info.is_10b_endian = 1;
-
     if (!pat_preproc) {
         int is_rga2_used = r->is_rga2_used ||
                            is_rga2_core_mask(out_info->scheduler_core);
 
-#ifdef RGA_NORMAL_DST_FULL_CSC_FIXUP
         if (in1_info && picref_pat) {
             enum AVColorSpace pat_colorspace = picref_pat->colorspace;
             enum AVColorRange pat_color_range = picref_pat->color_range;
             /* yuv2rgb src->pat */
             ret = set_colorspace_info(ctx, in0_info, in->colorspace, in->color_range,
                                       in1_info, &pat_colorspace, &pat_color_range,
-                                      &info.color_space_mode, is_rga2_used);
+                                      &color_space_mode, is_rga2_used);
             if (ret < 0)
                 goto fail;
             /* rgb2yuv pat->dst */
             ret = set_colorspace_info(ctx, in1_info, pat_colorspace, pat_color_range,
                                       out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
-                                      &info.color_space_mode, is_rga2_used);
+                                      &color_space_mode, is_rga2_used);
             if (ret < 0)
                 goto fail;
-        } else
-#endif
-        {
+        } else {
             ret = set_colorspace_info(ctx, in0_info, in->colorspace, in->color_range,
                                       out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
-                                      &info.color_space_mode, is_rga2_used);
+                                      &color_space_mode, is_rga2_used);
             if (ret < 0)
                 goto fail;
         }
     }
 
-    if (pat_preproc)
-        rga_set_rect(&info.rect, in1_info->overlay_x, in1_info->overlay_y,
-                     act_w, act_h,
-                     w_stride, h_stride, in1_info->rga_fmt);
-    else
-        rga_set_rect(&info.rect, out_info->act_x, out_info->act_y,
-                     act_w, act_h,
-                     w_stride, h_stride, out_info->rga_fmt);
+    if (pat_preproc) {
+        rect_x = in1_info->overlay_x;
+        rect_y = in1_info->overlay_y;
+        rga_fmt = in1_info->rga_fmt;
+    } else {
+        rect_x = out_info->act_x;
+        rect_y = out_info->act_y;
+        rga_fmt = out_info->rga_fmt;
+    }
 
     if (is_afbc) {
         uint32_t drm_afbc_fmt = get_drm_afbc_format(out_info->pix_fmt);
 
-#ifndef RGA_NORMAL_FBCE_RGB_BGR_FIXUP
-        /* Inverted RGB/BGR order in FBCE */
-        switch (info.rect.format) {
+        switch (rga_fmt) {
         case RK_FORMAT_RGBA_8888:
-            info.rect.format = RK_FORMAT_BGRA_8888;
+            rga_fmt = RK_FORMAT_BGRA_8888;
             break;
         case RK_FORMAT_BGRA_8888:
-            info.rect.format = RK_FORMAT_RGBA_8888;
+            rga_fmt = RK_FORMAT_RGBA_8888;
             break;
         }
-#endif
 
-        info.rect.wstride = w_stride;
-        info.rect.hstride = h_stride;
-        info.rd_mode = 1 << 1; /* IM_AFBC16x16_MODE */
+        rd_mode = IM_AFBC16x16_MODE;
 
         object->format_modifier =
             DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_SPARSE | AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
@@ -1601,14 +1650,24 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         layer->nb_planes = 1;
 
         layer->planes[0].offset = 0;
-        layer->planes[0].pitch  = info.rect.wstride;
+        layer->planes[0].pitch  = w_stride;
 
-        if ((ret = get_afbc_byte_stride(out_info->pix_desc, info.rect.wstride,
+        if ((ret = get_afbc_byte_stride(out_info->pix_desc, w_stride,
                                         &layer->planes[0].pitch)) < 0)
             goto fail;
     }
 
-    out_frame->info = info;
+    image.buf = wrapbuffer_fd_t(object->fd, frame_w, frame_h,
+                                w_stride, h_stride, rga_fmt);
+    image.buf.color_space_mode = color_space_mode;
+    image.buf.rd_mode = rd_mode;
+    image.buf.global_alpha = out_info->dst_global_alpha;
+    image.sync_mode = IM_ASYNC;
+    image.out_fence_fd = -1;
+    image.core = out_info->scheduler_core;
+    set_im_rect(&image.rect, rect_x, rect_y, act_w, act_h);
+
+    out_frame->image = image;
 
     return out_frame;
 
@@ -2002,6 +2061,9 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
 
     info->uncompact_10b_msb = info->pix_fmt == AV_PIX_FMT_P010 ||
                               info->pix_fmt == AV_PIX_FMT_P210;
+    info->blend_usage       = 0;
+    info->src_global_alpha  = 0xff;
+    info->dst_global_alpha  = 0xff;
 
     if (link->w * link->h > (3840 * 2160 * 3))
         r->async_depth = FFMIN(r->async_depth, 1);
@@ -2127,13 +2189,12 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
             r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
             need_premultiply = param->in_alpha_format == 0;
 
-        /* IM_ALPHA_BLEND_DST_OVER */
-        if (param->in_global_alpha >= 0 && param->in_global_alpha < 0xff) {
-            r->in_rga_frame_infos[0].blend_mode = need_premultiply ? (0x4 | (1 << 12)) : 0x4;
-            r->in_rga_frame_infos[0].blend_mode |= (param->in_global_alpha & 0xff) << 16; /* fg_global_alpha */
-            r->in_rga_frame_infos[0].blend_mode |= 0xff << 24;                            /* bg_global_alpha */
-        } else
-            r->in_rga_frame_infos[0].blend_mode = need_premultiply ? 0x504 : 0x501;
+        r->in_rga_frame_infos[0].blend_usage = IM_ALPHA_BLEND_DST_OVER;
+        if (need_premultiply)
+            r->in_rga_frame_infos[0].blend_usage |= IM_ALPHA_BLEND_PRE_MUL;
+        if (param->in_global_alpha >= 0 && param->in_global_alpha < 0xff)
+            r->in_rga_frame_infos[0].src_global_alpha = param->in_global_alpha & 0xff;
+        r->in_rga_frame_infos[0].dst_global_alpha = 0xff;
 
         r->in_rga_frame_infos[1].overlay_x = param->overlay_x;
         r->in_rga_frame_infos[1].overlay_y = param->overlay_y;
@@ -2216,7 +2277,7 @@ static void rga_drain_fifo(RKRGAContext *r)
     RGAAsyncFrame aframe;
 
     while (r->async_fifo && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (imsync(aframe.dst->image.out_fence_fd) != IM_STATUS_SUCCESS)
             av_log(NULL, AV_LOG_WARNING, "RGA sync failed\n");
 
         set_rga_async_frame_lock_status(&aframe, 0);
@@ -2246,36 +2307,63 @@ av_cold int ff_rkrga_close(AVFilterContext *avctx)
     return 0;
 }
 
-static int call_rkrga_blit(AVFilterContext *avctx,
-                          rga_info_t *src_info,
-                          rga_info_t *dst_info,
-                          rga_info_t *pat_info)
+static int is_im2d_success(IM_STATUS status)
 {
-    int ret;
+    return status == IM_STATUS_SUCCESS || status == IM_STATUS_NOERROR;
+}
 
-    if (!src_info || !dst_info)
+static int call_rkrga_im2d(AVFilterContext *avctx,
+                           RGAImage *src_image,
+                           RGAImage *dst_image,
+                           RGAImage *pat_image)
+{
+    rga_buffer_t empty_buf = { 0 };
+    im_rect empty_rect = { 0 };
+    im_opt_t opt = { 0 };
+    int usage;
+    IM_STATUS ret;
+
+    if (!src_image || !dst_image)
         return AVERROR(EINVAL);
 
-#define PRINT_RGA_INFO(ctx, info, name) do { \
-    if (info && name) \
-        av_log(ctx, AV_LOG_DEBUG, "RGA %s | fd:%d mmu:%d rd:%d csc:%d | x:%d y:%d w:%d h:%d ws:%d hs:%d fmt:0x%x\n", \
-               name, info->fd, info->mmuFlag, (info->rd_mode >> 1), info->color_space_mode, info->rect.xoffset, info->rect.yoffset, \
-               info->rect.width, info->rect.height, info->rect.wstride, info->rect.hstride, (info->rect.format >> 8)); \
+#define PRINT_RGA_IMAGE(ctx, image, name) do { \
+    if (image && name) \
+        av_log(ctx, AV_LOG_DEBUG, "RGA %s | fd:%d rd:%d csc:%d alpha:%d usage:0x%x | x:%d y:%d w:%d h:%d ws:%d hs:%d fmt:0x%x\n", \
+               name, (image)->buf.fd, ((image)->buf.rd_mode >> 1), \
+               (image)->buf.color_space_mode, (image)->buf.global_alpha, \
+               (image)->usage, (image)->rect.x, (image)->rect.y, \
+               (image)->rect.width, (image)->rect.height, \
+               (image)->buf.wstride, (image)->buf.hstride, \
+               ((image)->buf.format >> 8)); \
 } while (0)
 
-    PRINT_RGA_INFO(avctx, src_info, "src");
-    PRINT_RGA_INFO(avctx, dst_info, "dst");
-    PRINT_RGA_INFO(avctx, pat_info, "pat");
-#undef PRINT_RGA_INFO
+    PRINT_RGA_IMAGE(avctx, src_image, "src");
+    PRINT_RGA_IMAGE(avctx, dst_image, "dst");
+    PRINT_RGA_IMAGE(avctx, pat_image, "pat");
+#undef PRINT_RGA_IMAGE
 
-    if ((ret = c_RkRgaBlit(src_info, dst_info, pat_info)) != 0) {
-        av_log(avctx, AV_LOG_ERROR, "RGA blit failed: %d\n", ret);
+    usage = src_image->usage |
+            (dst_image->sync_mode == IM_ASYNC ? IM_ASYNC : IM_SYNC);
+
+    opt.version  = RGA_CURRENT_API_HEADER_VERSION;
+    opt.priority = dst_image->priority;
+    opt.core     = dst_image->core;
+    opt.interp   = IM_INTERP_DEFAULT;
+
+    dst_image->out_fence_fd = -1;
+    ret = improcessOpt(src_image->buf, dst_image->buf,
+                       pat_image ? pat_image->buf : empty_buf,
+                       src_image->rect, dst_image->rect,
+                       pat_image ? pat_image->rect : empty_rect,
+                       -1, &dst_image->out_fence_fd, &opt, usage);
+    if (!is_im2d_success(ret)) {
+        av_log(avctx, AV_LOG_ERROR, "RGA IM2D process failed: %d\n", ret);
         return AVERROR_EXTERNAL;
     }
-    if (dst_info->sync_mode == RGA_BLIT_ASYNC &&
-        dst_info->out_fence_fd < 0) {
-        av_log(avctx, AV_LOG_ERROR, "RGA async blit returned invalid fence_fd: %d\n",
-               dst_info->out_fence_fd);
+    if (dst_image->sync_mode == IM_ASYNC &&
+        dst_image->out_fence_fd < 0) {
+        av_log(avctx, AV_LOG_ERROR, "RGA async process returned invalid fence_fd: %d\n",
+               dst_image->out_fence_fd);
         return AVERROR_EXTERNAL;
     }
 
@@ -2301,7 +2389,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
 
     /* Sync & Drain */
     while (r->eof && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (imsync(aframe.dst->image.out_fence_fd) != IM_STATUS_SUCCESS)
             av_log(ctx, AV_LOG_WARNING, "RGA sync failed\n");
 
         set_rga_async_frame_lock_status(&aframe, 0);
@@ -2359,14 +2447,14 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
                 ret = AVERROR(ENOMEM);
                 goto fail;
             }
-            dst_frame->info.core = out_info->scheduler_core;
+            dst_frame->image.core = out_info->scheduler_core;
 
-            pat_out->info.priority = 1;
-            pat_out->info.core = dst_frame->info.core;
-            pat_out->info.sync_mode = RGA_BLIT_SYNC;
+            pat_out->image.priority = 1;
+            pat_out->image.core = dst_frame->image.core;
+            pat_out->image.sync_mode = IM_SYNC;
 
             /* Sync Blit Pre-Proc */
-            ret = call_rkrga_blit(ctx, &pat_in->info, &pat_out->info, NULL);
+            ret = call_rkrga_im2d(ctx, &pat_in->image, &pat_out->image, NULL);
             if (ret < 0)
                 goto fail;
 
@@ -2380,37 +2468,37 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
             ret = AVERROR(ENOMEM);
             goto fail;
         }
-        dst_frame->info.core = out_info->scheduler_core;
+        dst_frame->image.core = out_info->scheduler_core;
 
         if (pat_preprocessed) {
-            rga_info_t src_copy_info = src_frame->info;
-            rga_info_t dst_copy_info = dst_frame->info;
+            RGAImage src_copy_image = src_frame->image;
+            RGAImage dst_copy_image = dst_frame->image;
 
-            src_copy_info.blend = 0;
-            dst_copy_info.sync_mode = RGA_BLIT_SYNC;
-            dst_copy_info.out_fence_fd = -1;
+            src_copy_image.usage &= ~(IM_ALPHA_BLEND_MASK | IM_ALPHA_BLEND_PRE_MUL);
+            dst_copy_image.sync_mode = IM_SYNC;
+            dst_copy_image.out_fence_fd = -1;
 
-            ret = call_rkrga_blit(ctx, &src_copy_info, &dst_copy_info, NULL);
+            ret = call_rkrga_im2d(ctx, &src_copy_image, &dst_copy_image, NULL);
             if (ret < 0)
                 goto fail;
 
-            src_frame->info.rect.xoffset += in1_info->overlay_x;
-            src_frame->info.rect.yoffset += in1_info->overlay_y;
-            src_frame->info.rect.width    = pat_frame->info.rect.width;
-            src_frame->info.rect.height   = pat_frame->info.rect.height;
+            src_frame->image.rect.x      += in1_info->overlay_x;
+            src_frame->image.rect.y      += in1_info->overlay_y;
+            src_frame->image.rect.width   = pat_frame->image.rect.width;
+            src_frame->image.rect.height  = pat_frame->image.rect.height;
 
-            dst_frame->info.rect.xoffset += in1_info->overlay_x;
-            dst_frame->info.rect.yoffset += in1_info->overlay_y;
-            dst_frame->info.rect.width    = pat_frame->info.rect.width;
-            dst_frame->info.rect.height   = pat_frame->info.rect.height;
+            dst_frame->image.rect.x      += in1_info->overlay_x;
+            dst_frame->image.rect.y      += in1_info->overlay_y;
+            dst_frame->image.rect.width   = pat_frame->image.rect.width;
+            dst_frame->image.rect.height  = pat_frame->image.rect.height;
         }
     }
 
     /* Async Blit */
-    ret = call_rkrga_blit(ctx,
-                          &src_frame->info,
-                          &dst_frame->info,
-                          pat_frame ? &pat_frame->info : NULL);
+    ret = call_rkrga_im2d(ctx,
+                          &src_frame->image,
+                          &dst_frame->image,
+                          pat_frame ? &pat_frame->image : NULL);
     if (ret < 0)
         goto fail;
 
@@ -2419,7 +2507,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     set_rga_async_frame_lock_status(&aframe, 1);
     ret = av_fifo_write(r->async_fifo, &aframe, 1);
     if (ret < 0) {
-        if (imsync(dst_frame->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (imsync(dst_frame->image.out_fence_fd) != IM_STATUS_SUCCESS)
             av_log(ctx, AV_LOG_WARNING, "RGA sync failed\n");
         set_rga_async_frame_lock_status(&aframe, 0);
         goto fail;
@@ -2428,7 +2516,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     /* Sync & Retrieve */
     if (av_fifo_can_read(r->async_fifo) > r->async_depth) {
         av_fifo_read(r->async_fifo, &aframe, 1);
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS) {
+        if (imsync(aframe.dst->image.out_fence_fd) != IM_STATUS_SUCCESS) {
             av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
             set_rga_async_frame_lock_status(&aframe, 0);
             release_frame(aframe.src);
