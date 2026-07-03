@@ -495,11 +495,24 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     RKMPPDRMMapping *map;
     int err, i, p, plane;
     int mmap_prot;
+    int have_mpp_buffers = 0;
     void *addr;
 
     err = rkmpp_validate_drm_descriptor(hwfc, desc);
     if (err < 0)
         return err;
+
+    /* the MppBuffer pointers live past the end of the base
+     * AVDRMFrameDescriptor: only trust them when the descriptor buffer is
+     * actually large enough, otherwise fall back to mmap of the fds */
+    for (i = 0; i < AV_NUM_DATA_POINTERS; i++) {
+        if (src->buf[i] &&
+            src->buf[i]->data == src->data[0] &&
+            src->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor)) {
+            have_mpp_buffers = 1;
+            break;
+        }
+    }
 
     map = av_mallocz(sizeof(*map));
     if (!map)
@@ -522,7 +535,7 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
 
     for (i = 0; i < desc->drm_desc.nb_objects; i++) {
         addr = NULL;
-        if (desc->buffers[i])
+        if (have_mpp_buffers && desc->buffers[i])
             addr = mpp_buffer_get_ptr(desc->buffers[i]);
 
         if (addr) {
