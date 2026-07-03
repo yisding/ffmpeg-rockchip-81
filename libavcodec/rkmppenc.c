@@ -734,7 +734,18 @@ static MPPEncFrame *get_free_frame(MPPEncFrame **list)
 
 static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
 {
+    const AVHWFramesContext *hwfc;
+
     if (!frame || !frame->data[0])
+        return NULL;
+
+    /* only RKMPP hwcontext frames carry the extended descriptor: a foreign
+     * DRM_PRIME frame whose descriptor buffer merely happens to be large
+     * enough must not have its trailing bytes read as afbc_offset_y */
+    if (!frame->hw_frames_ctx)
+        return NULL;
+    hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+    if (hwfc->device_ctx->type != AV_HWDEVICE_TYPE_RKMPP)
         return NULL;
 
     for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
