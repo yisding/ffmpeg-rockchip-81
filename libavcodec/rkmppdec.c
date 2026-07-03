@@ -151,10 +151,17 @@ static int rkmpp_mjpeg_output_buffer_size(AVCodecContext *avctx,
 {
     int width = avctx->width > 0 ? avctx->width : avctx->coded_width;
     int height = avctx->height > 0 ? avctx->height : avctx->coded_height;
+    int parsed_width = 0, parsed_height = 0;
     uint64_t aligned_width, aligned_height;
 
-    if ((width <= 0 || height <= 0) && pkt->data && pkt->size > 0)
-        rkmpp_mjpeg_parse_dimensions(pkt->data, pkt->size, &width, &height);
+    /* the bitstream may be larger than the container-declared size:
+     * trust the SOF dimensions when they exceed the context ones */
+    if (pkt->data && pkt->size > 0 &&
+        rkmpp_mjpeg_parse_dimensions(pkt->data, pkt->size,
+                                     &parsed_width, &parsed_height)) {
+        width  = FFMAX(width,  parsed_width);
+        height = FFMAX(height, parsed_height);
+    }
 
     if (width <= 0 || height <= 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to determine MJPEG dimensions\n");
@@ -944,15 +951,25 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         r->frames_pending--;
     if (mpp_frame_get_eos(mpp_frame)) {
         av_log(avctx, AV_LOG_DEBUG, "Received a 'EOS' frame\n");
+        /* MPP signals EOS only once: remember it even when the EOS frame
+         * carries valid data, otherwise the next drain call would block
+         * forever waiting for a frame that never arrives */
+        r->eof = 1;
         /* EOS frame may contain valid data */
         if (!mpp_frame_get_buffer(mpp_frame)) {
-            r->eof = 1;
             ret = AVERROR_EOF;
             goto exit;
         }
     }
     if (mpp_frame_get_discard(mpp_frame)) {
         av_log(avctx, AV_LOG_DEBUG, "Received a 'discard' frame\n");
+        /* during draining decodable frames may still be queued behind the
+         * discarded one: retry, otherwise the caller would turn the EAGAIN
+         * into a premature EOF */
+        if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
+            mpp_frame_deinit(&mpp_frame);
+            return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_MAX);
+        }
         ret = AVERROR(EAGAIN);
         goto exit;
     }
@@ -972,13 +989,18 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             goto exit;
         }
         if (!ignore_err) {
-            /* bail out from the loop, surfacing the error instead of a clean EOF */
-            r->eof = 1;
+            /* surface the error for this frame only; latching EOF here would
+             * permanently end streams (e.g. live MJPEG capture) whose later
+             * frames are still decodable */
             ret = AVERROR_INVALIDDATA;
             goto exit;
         }
         /* return decodable frames flagged as corrupt, drop buffer-less ones */
         if (!mpp_frame_get_buffer(mpp_frame)) {
+            if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
+                mpp_frame_deinit(&mpp_frame);
+                return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_MAX);
+            }
             ret = AVERROR(EAGAIN);
             goto exit;
         }
@@ -1082,6 +1104,8 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
 export:
         av_log(avctx, AV_LOG_DEBUG, "Received a frame\n");
         r->got_frame = 1;
+        /* colorimetry may change mid-stream without an info-change event */
+        rkmpp_export_avctx_color_props(avctx, mpp_frame);
 
         switch (avctx->pix_fmt) {
         case AV_PIX_FMT_DRM_PRIME:

@@ -320,22 +320,26 @@ static av_cold int set_size_info(AVFilterContext *ctx,
         case TRANSPOSE_CCLOCK_FLIP:
             r->in_rotate_mode = 0x07 ^ 0x01; /* HAL_TRANSFORM_ROT_270 + HAL_TRANSFORM_FLIP_H */
             FFSWAP(int, outlink->w, outlink->h);
-            FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
+            if (outlink->sample_aspect_ratio.num)
+                FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
         case TRANSPOSE_CLOCK:
             r->in_rotate_mode = 0x04; /* HAL_TRANSFORM_ROT_90 */
             FFSWAP(int, outlink->w, outlink->h);
-            FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
+            if (outlink->sample_aspect_ratio.num)
+                FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
         case TRANSPOSE_CCLOCK:
             r->in_rotate_mode = 0x07; /* HAL_TRANSFORM_ROT_270 */
             FFSWAP(int, outlink->w, outlink->h);
-            FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
+            if (outlink->sample_aspect_ratio.num)
+                FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
         case TRANSPOSE_CLOCK_FLIP:
             r->in_rotate_mode = 0x04 | 0x01; /* HAL_TRANSFORM_ROT_90 + HAL_TRANSFORM_FLIP_H */
             FFSWAP(int, outlink->w, outlink->h);
-            FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
+            if (outlink->sample_aspect_ratio.num)
+                FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
         case TRANSPOSE_REVERSAL:
             r->in_rotate_mode = 0x03; /* HAL_TRANSFORM_ROT_180 */

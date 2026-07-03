@@ -934,7 +934,18 @@ static void release_frame(RGAFrame *frame)
 
 static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
 {
+    const AVHWFramesContext *hwfc;
+
     if (!frame || !frame->data[0])
+        return NULL;
+
+    /* only RKMPP hwcontext frames carry the extended descriptor: a foreign
+     * DRM_PRIME frame whose descriptor buffer merely happens to be large
+     * enough must not have its trailing bytes read as afbc_offset_y */
+    if (!frame->hw_frames_ctx)
+        return NULL;
+    hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+    if (hwfc->device_ctx->type != AV_HWDEVICE_TYPE_RKMPP)
         return NULL;
 
     for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
@@ -1384,19 +1395,23 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     out_frame->frame->crop_bottom = 0;
     out_frame->frame->crop_left   = 0;
     out_frame->frame->crop_right  = 0;
-    if ((in0_info->rotate_mode & 0x04) == 0x04 /* HAL_TRANSFORM_ROT_90 */ ||
-        (in0_info->rotate_mode & 0x07) == 0x07 /* HAL_TRANSFORM_ROT_270 */) {
-        av_reduce(&out_frame->frame->sample_aspect_ratio.den,
-                  &out_frame->frame->sample_aspect_ratio.num,
-                  (int64_t)in->sample_aspect_ratio.num * outlink->w * in0_info->act_w,
-                  (int64_t)in->sample_aspect_ratio.den * outlink->h * in0_info->act_h,
-                  INT_MAX);
-    } else {
-        av_reduce(&out_frame->frame->sample_aspect_ratio.num,
-                  &out_frame->frame->sample_aspect_ratio.den,
-                  (int64_t)in->sample_aspect_ratio.num * outlink->h * in0_info->act_w,
-                  (int64_t)in->sample_aspect_ratio.den * outlink->w * in0_info->act_h,
-                  INT_MAX);
+    /* an unknown input SAR (0/den) must stay as copied from the input:
+     * scaling it would turn 0/1 into the invalid 1/0 in the rotated case */
+    if (in->sample_aspect_ratio.num) {
+        if ((in0_info->rotate_mode & 0x04) == 0x04 /* HAL_TRANSFORM_ROT_90 */ ||
+            (in0_info->rotate_mode & 0x07) == 0x07 /* HAL_TRANSFORM_ROT_270 */) {
+            av_reduce(&out_frame->frame->sample_aspect_ratio.den,
+                      &out_frame->frame->sample_aspect_ratio.num,
+                      (int64_t)in->sample_aspect_ratio.num * outlink->w * in0_info->act_w,
+                      (int64_t)in->sample_aspect_ratio.den * outlink->h * in0_info->act_h,
+                      INT_MAX);
+        } else {
+            av_reduce(&out_frame->frame->sample_aspect_ratio.num,
+                      &out_frame->frame->sample_aspect_ratio.den,
+                      (int64_t)in->sample_aspect_ratio.num * outlink->h * in0_info->act_w,
+                      (int64_t)in->sample_aspect_ratio.den * outlink->w * in0_info->act_h,
+                      INT_MAX);
+        }
     }
 
     if ((ret = av_hwframe_get_buffer(hw_frame_ctx, out_frame->frame, 0)) < 0) {

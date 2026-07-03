@@ -318,7 +318,7 @@ static int v4l2_bufref_to_buf(V4L2Buffer *out, int plane, const uint8_t* data, i
 static int v4l2_copy_plane_to_buf_at(V4L2Buffer *out, int plane,
                                       const uint8_t *data, int src_linesize,
                                       int row_bytes, int dst_linesize,
-                                      int rows, int offset)
+                                      int rows, int src_rows, int offset)
 {
     uint8_t *dst;
     uint64_t size, end;
@@ -326,7 +326,7 @@ static int v4l2_copy_plane_to_buf_at(V4L2Buffer *out, int plane,
 
     if (plane >= out->num_planes || !data ||
         src_linesize < row_bytes || dst_linesize < row_bytes ||
-        rows <= 0 || row_bytes <= 0 || offset < 0)
+        rows <= 0 || src_rows <= 0 || row_bytes <= 0 || offset < 0)
         return AVERROR(EINVAL);
 
     size = (uint64_t)dst_linesize * rows;
@@ -335,11 +335,20 @@ static int v4l2_copy_plane_to_buf_at(V4L2Buffer *out, int plane,
         out->plane_info[plane].length > UINT_MAX)
         return AVERROR(EINVAL);
 
+    /* the driver format may have more (alignment padding) rows than the
+     * source frame: replicate the last source row instead of reading past
+     * the end of the source plane */
+    src_rows = FFMIN(src_rows, rows);
+
     dst = (uint8_t*)out->plane_info[plane].mm_addr + offset;
-    for (int row = 0; row < rows; row++) {
+    for (int row = 0; row < src_rows; row++) {
         memcpy(dst, data, row_bytes);
         dst  += dst_linesize;
         data += src_linesize;
+    }
+    for (int row = src_rows; row < rows; row++) {
+        memcpy(dst, data - src_linesize, row_bytes);
+        dst += dst_linesize;
     }
 
     bytesused = end;
@@ -356,7 +365,7 @@ static int v4l2_copy_plane_to_buf_at(V4L2Buffer *out, int plane,
 
 static int v4l2_copy_plane_to_buf(V4L2Buffer *out, int plane,
                                   const uint8_t *data, int src_linesize,
-                                  int row_bytes, int rows)
+                                  int row_bytes, int rows, int src_rows)
 {
     int dst_linesize;
 
@@ -365,7 +374,7 @@ static int v4l2_copy_plane_to_buf(V4L2Buffer *out, int plane,
 
     dst_linesize = out->plane_info[plane].bytesperline;
     return v4l2_copy_plane_to_buf_at(out, plane, data, src_linesize,
-                                     row_bytes, dst_linesize, rows, 0);
+                                     row_bytes, dst_linesize, rows, src_rows, 0);
 }
 
 static int v4l2_single_buffer_plane_linesize(enum AVPixelFormat pix_fmt,
@@ -502,11 +511,12 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
             return ret;
 
         for (i = 0; i < planes_nb; i++) {
-            int dst_linesize, h = height;
+            int dst_linesize, h = height, src_h = frame->height;
             int64_t size;
 
             if (i == 1 || i == 2) {
                 h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
+                src_h = AV_CEIL_RSHIFT(src_h, desc->log2_chroma_h);
             }
 
             ret = v4l2_single_buffer_plane_linesize(frame->format, desc,
@@ -524,7 +534,7 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
             ret = v4l2_copy_plane_to_buf_at(out, 0, frame->data[i],
                                             frame->linesize[i],
                                             row_bytes[i], dst_linesize,
-                                            h, offset);
+                                            h, src_h, offset);
             if (ret)
                 return ret;
             offset += size;
@@ -552,16 +562,20 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
             return ret;
 
         for (i = 0; i < out->num_planes; i++) {
+            int src_rows = frame->height;
+
             plane_rows[i] = height;
-            if (i == 1 || i == 2)
+            if (i == 1 || i == 2) {
                 plane_rows[i] = AV_CEIL_RSHIFT(height, desc->log2_chroma_h);
+                src_rows = AV_CEIL_RSHIFT(src_rows, desc->log2_chroma_h);
+            }
 
             if (!frame->data[i])
                 return AVERROR(EINVAL);
 
             ret = v4l2_copy_plane_to_buf(out, i, frame->data[i],
                                          frame->linesize[i],
-                                         row_bytes[i], plane_rows[i]);
+                                         row_bytes[i], plane_rows[i], src_rows);
             if (ret)
                 return ret;
         }
