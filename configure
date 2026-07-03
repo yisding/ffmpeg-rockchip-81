@@ -7515,17 +7515,21 @@ enabled rkmpp             && { require_pkg_config rkmpp "rockchip_mpp >= 1.3.9" 
                                { enabled libdrm ||
                                  die "ERROR: rkmpp requires --enable-libdrm"; }
                              }
-enabled rkrga             && { require_pkg_config rkrga librga rga/RgaApi.h c_RkRgaBlit &&
-                               require_pkg_config rkrga librga rga/im2d.h "querystring imsync" &&
-                               require_cc rkrga "rga/RgaApi.h rga/im2d.h" "rga_info_t info = { 0 };
-                                  info.is_10b_compact = 1;
-                                  info.is_10b_endian = 1;
-                                  info.core = 0;
-                                  info.priority = 1;
-                                  info.sync_mode = RGA_BLIT_ASYNC;
-                                  int status = IM_STATUS_SUCCESS;
-                                  (void)status;
-                                  (void)info" &&
+enabled rkrga             && { require_pkg_config rkrga librga rga/im2d.h "querystring imsync improcessOpt wrapbuffer_fd_t" &&
+                               require_cc rkrga "rga/im2d.h" "rga_buffer_t buf = { 0 };
+                                  im_rect rect = { 0, 0, 16, 16 };
+                                  im_opt_t opt = { 0 };
+                                  int usage = IM_ASYNC | IM_ALPHA_BLEND_DST_OVER | IM_ALPHA_BLEND_PRE_MUL;
+                                  buf = wrapbuffer_fd_t(-1, 16, 16, 16, 16, RK_FORMAT_P010);
+                                  buf.format = RK_FORMAT_P210;
+                                  opt.version = RGA_CURRENT_API_HEADER_VERSION;
+                                  opt.core = 0;
+                                  opt.priority = 1;
+                                  opt.interp = IM_INTERP_DEFAULT;
+                                  (void)rect;
+                                  (void)usage;
+                                  (void)buf;
+                                  (void)opt" &&
                                { enabled rkmpp ||
                                  die "ERROR: rkrga requires --enable-rkmpp"; }
                              }
