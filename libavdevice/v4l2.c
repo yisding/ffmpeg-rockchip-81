@@ -1173,10 +1173,15 @@ static int device_try_init(AVFormatContext *ctx,
     }
 
     if (!*desired_format) {
+        /* prefer the requested pixel format, but fall back to anything the
+         * device supports, matching upstream behavior */
+        int require_pix_fmt = pix_fmt != AV_PIX_FMT_NONE;
+
+retry:
         for (i = 0; ff_fmt_conversion_table[i].codec_id != AV_CODEC_ID_NONE; i++) {
             if ((ctx->video_codec_id == AV_CODEC_ID_NONE ||
                  ff_fmt_conversion_table[i].codec_id == ctx->video_codec_id) &&
-                (pix_fmt == AV_PIX_FMT_NONE ||
+                (!require_pix_fmt ||
                  ff_fmt_conversion_table[i].ff_fmt == pix_fmt)) {
                 av_log(ctx, AV_LOG_DEBUG, "Trying to set codec:%s pix_fmt:%s\n",
                        avcodec_get_name(ff_fmt_conversion_table[i].codec_id),
@@ -1190,6 +1195,15 @@ static int device_try_init(AVFormatContext *ctx,
                     return ret;
                 *desired_format = 0;
             }
+        }
+
+        if (*desired_format == 0 && require_pix_fmt) {
+            av_log(ctx, AV_LOG_WARNING,
+                   "Pixel format '%s' rejected by the device, "
+                   "trying other supported formats\n",
+                   (char *)av_x_if_null(av_get_pix_fmt_name(pix_fmt), "none"));
+            require_pix_fmt = 0;
+            goto retry;
         }
 
         if (*desired_format == 0) {
