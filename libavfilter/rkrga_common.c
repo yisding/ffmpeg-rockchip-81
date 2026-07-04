@@ -125,6 +125,76 @@ overlay:
     return 0;
 }
 
+typedef enum {
+    RGA_FW_GENERIC = 0, /* av_image_get_linesize + category alignment */
+    RGA_FW_NV10BIT,     /* 10-bit compact packed luma special formula */
+    RGA_FW_SCALEW,      /* width scaled by bpp then row aligned (P010/P210) */
+} RGAFwKind;
+
+typedef enum {
+    RGA_CHROMA_NONE = 0, /* single plane / packed, no chroma pitch */
+    RGA_CHROMA_EQUAL,    /* chroma pitch == luma pitch */
+    RGA_CHROMA_SUBW,     /* chroma pitch == luma pitch >> log2_chroma_w */
+    RGA_CHROMA_DOUBLE,   /* chroma pitch == luma pitch * 2 */
+} RGAChromaMode;
+
+typedef struct RGAStrideDesc {
+    enum AVPixelFormat pix_fmt;
+    int bpp_num, bpp_den;   /* luma bytes-per-pixel fraction: ws = pitch*bpp_den/bpp_num */
+    RGAFwKind fw_kind;      /* forward special-formula selector (get_aligned_linesize) */
+    int fw_row_align;       /* row align used by NV10BIT/SCALEW (0 otherwise) */
+    RGAChromaMode chroma_mode;
+    int rga3_ok;            /* 0 => RGA3-incompatible (is_pixel_stride_rga3_compat returns 0) */
+    int rga3_ws_align;      /* ws modulus */
+    int rga3_hs_align;      /* hs modulus; 0 => no hs check */
+} RGAStrideDesc;
+
+/* One row per format in the union of YUV_FORMATS + RGB_FORMATS, same order. */
+static const RGAStrideDesc rga_stride_descs[] = {
+    { AV_PIX_FMT_GRAY8,       1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   0,  0, 0 },
+    { AV_PIX_FMT_YUV420P,     1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_YUVJ420P,    1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_YUV422P,     1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_YUVJ422P,    1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_NV12,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_EQUAL,  1, 16, 2 },
+    { AV_PIX_FMT_NV21,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_EQUAL,  1, 16, 2 },
+    { AV_PIX_FMT_NV16,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_EQUAL,  1, 16, 2 },
+    { AV_PIX_FMT_NV24,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_DOUBLE, 0,  0, 0 },
+    { AV_PIX_FMT_NV42,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_DOUBLE, 0,  0, 0 },
+    { AV_PIX_FMT_P010,        2, 1, RGA_FW_SCALEW,  64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_P210,        2, 1, RGA_FW_SCALEW,  64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_NV15,       10, 8, RGA_FW_NV10BIT, 64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_NV20_PACKED,10, 8, RGA_FW_NV10BIT, 64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_YUYV422,     2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 2 },
+    { AV_PIX_FMT_YVYU422,     2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 2 },
+    { AV_PIX_FMT_UYVY422,     2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 2 },
+    { AV_PIX_FMT_RGB555LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   0,  0, 0 },
+    { AV_PIX_FMT_BGR555LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   0,  0, 0 },
+    { AV_PIX_FMT_RGB565LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 0 },
+    { AV_PIX_FMT_BGR565LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 0 },
+    { AV_PIX_FMT_RGB24,       3, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1, 16, 0 },
+    { AV_PIX_FMT_BGR24,       3, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1, 16, 0 },
+    { AV_PIX_FMT_RGBA,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_RGB0,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_BGRA,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_BGR0,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_ARGB,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_0RGB,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_ABGR,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_0BGR,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+};
+
+static const RGAStrideDesc *rga_get_stride_desc(enum AVPixelFormat pix_fmt)
+{
+    int i;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(rga_stride_descs); i++) {
+        if (rga_stride_descs[i].pix_fmt == pix_fmt)
+            return &rga_stride_descs[i];
+    }
+    return NULL;
+}
+
 static int get_pixel_stride(const AVDRMObjectDescriptor *object,
                             const AVDRMLayerDescriptor *layer,
                             enum AVPixelFormat pix_fmt,
@@ -145,58 +215,22 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
     if (plane0->pitch <= 0 || plane0->pitch > INT_MAX)
         return AVERROR(EINVAL);
 
-    if (is_packed_fmt) {
-        int min_linesize = av_image_get_linesize(pix_fmt, width, 0);
+    {
+        const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
 
-        if (min_linesize < 0)
-            return min_linesize;
-        if (plane0->pitch < min_linesize)
+        if (!row)
             return AVERROR(EINVAL);
-        switch (pix_fmt) {
-        case AV_PIX_FMT_GRAY8:
-            *ws = plane0->pitch;
-            break;
-        case AV_PIX_FMT_RGB555LE:
-        case AV_PIX_FMT_BGR555LE:
-        case AV_PIX_FMT_RGB565LE:
-        case AV_PIX_FMT_BGR565LE:
-        case AV_PIX_FMT_YUYV422:
-        case AV_PIX_FMT_YVYU422:
-        case AV_PIX_FMT_UYVY422:
-            if (plane0->pitch % 2)
+        if (is_packed_fmt) {
+            int min_linesize = av_image_get_linesize(pix_fmt, width, 0);
+
+            if (min_linesize < 0)
+                return min_linesize;
+            if (plane0->pitch < min_linesize)
                 return AVERROR(EINVAL);
-            *ws = plane0->pitch / 2;
-            break;
-        case AV_PIX_FMT_RGB24:
-        case AV_PIX_FMT_BGR24:
-            if (plane0->pitch % 3)
-                return AVERROR(EINVAL);
-            *ws = plane0->pitch / 3;
-            break;
-        default:
-            if (plane0->pitch % 4)
-                return AVERROR(EINVAL);
-            *ws = plane0->pitch / 4;
-            break;
         }
-    } else {
-        switch (pix_fmt) {
-        case AV_PIX_FMT_P010:
-        case AV_PIX_FMT_P210:
-            if (plane0->pitch % 2)
-                return AVERROR(EINVAL);
-            *ws = plane0->pitch / 2;
-            break;
-        case AV_PIX_FMT_NV15:
-        case AV_PIX_FMT_NV20_PACKED:
-            if ((int64_t)plane0->pitch * 8 % 10)
-                return AVERROR(EINVAL);
-            *ws = (int64_t)plane0->pitch * 8 / 10;
-            break;
-        default:
-            *ws = plane0->pitch;
-            break;
-        }
+        if ((int64_t)plane0->pitch * row->bpp_den % row->bpp_num)
+            return AVERROR(EINVAL);
+        *ws = (int64_t)plane0->pitch * row->bpp_den / row->bpp_num;
     }
     if (is_packed_fmt) {
         h_stride = ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2);
@@ -461,24 +495,24 @@ static int get_aligned_linesize(enum AVPixelFormat pix_fmt, int width, int plane
     is_fully_planar = is_planar &&
                       pixdesc->comp[1].plane != pixdesc->comp[2].plane;
 
-    if (pix_fmt == AV_PIX_FMT_NV15 ||
-        pix_fmt == AV_PIX_FMT_NV20_PACKED) {
-        int width_align_256_odds = FFALIGN(width, 256) | 256;
-        return FFALIGN(width_align_256_odds * 10 / 8, 64);
+    const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
+    if (row) {
+        if (row->fw_kind == RGA_FW_NV10BIT) {
+            int wa = FFALIGN(width, 256) | 256;
+            return FFALIGN(wa * row->bpp_num / row->bpp_den, row->fw_row_align);
+        }
+        if (row->fw_kind == RGA_FW_SCALEW)
+            return FFALIGN(width, row->fw_row_align) * row->bpp_num;
+        if (row->chroma_mode == RGA_CHROMA_DOUBLE && plane)
+            return FFALIGN(width, 64) * 2;
     }
-    if (pix_fmt == AV_PIX_FMT_P010 ||
-        pix_fmt == AV_PIX_FMT_P210)
-        return FFALIGN(width, 64) * 2;
-    if ((pix_fmt == AV_PIX_FMT_NV24 ||
-         pix_fmt == AV_PIX_FMT_NV42) && plane)
-        return FFALIGN(width, 64) * 2;
 
     linesize = av_image_get_linesize(pix_fmt, width, plane);
     if (linesize < 0)
         return linesize;
 
     if (is_packed_fmt) {
-        int pixel_width = av_get_padded_bits_per_pixel(pixdesc) / 8;
+        int pixel_width = row ? row->bpp_num : av_get_padded_bits_per_pixel(pixdesc) / 8;
 
         if (pixel_width <= 0)
             return AVERROR(EINVAL);
@@ -543,29 +577,17 @@ static int reset_linear_drm_desc(AVFilterContext *avctx,
 }
 
 static int is_pixel_stride_rga3_compat(int ws, int hs,
-                                       enum _Rga_SURF_FORMAT fmt)
+                                       enum AVPixelFormat pix_fmt)
 {
-    switch (fmt) {
-    case RK_FORMAT_YCbCr_420_SP:
-    case RK_FORMAT_YCrCb_420_SP:
-    case RK_FORMAT_YCbCr_422_SP:     return !(ws % 16) && !(hs % 2);
-    case RK_FORMAT_YCbCr_420_SP_10B:
-    case RK_FORMAT_YCbCr_422_SP_10B:
-    case RK_FORMAT_P010:
-    case RK_FORMAT_P210:             return !(ws % 64) && !(hs % 2);
-    case RK_FORMAT_YUYV_422:
-    case RK_FORMAT_YVYU_422:
-    case RK_FORMAT_UYVY_422:         return !(ws % 8) && !(hs % 2);
-    case RK_FORMAT_RGB_565:
-    case RK_FORMAT_BGR_565:          return !(ws % 8);
-    case RK_FORMAT_RGB_888:
-    case RK_FORMAT_BGR_888:          return !(ws % 16);
-    case RK_FORMAT_RGBA_8888:
-    case RK_FORMAT_BGRA_8888:
-    case RK_FORMAT_ARGB_8888:
-    case RK_FORMAT_ABGR_8888:        return !(ws % 4);
-    default:                         return 0;
-    }
+    const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
+
+    if (!row || !row->rga3_ok)
+        return 0;
+    if (ws % row->rga3_ws_align)
+        return 0;
+    if (row->rga3_hs_align && (hs % row->rga3_hs_align))
+        return 0;
+    return 1;
 }
 
 static int is_rga2_core_mask(int scheduler_core)
@@ -606,7 +628,7 @@ static int validate_rga3_pixel_stride(AVFilterContext *avctx,
     RKRGAContext *r = avctx->priv;
 
     if (!rga3_core_can_be_used(r, out ? out->scheduler_core : r->scheduler_core) ||
-        is_pixel_stride_rga3_compat(ws, hs, info->rga_fmt))
+        is_pixel_stride_rga3_compat(ws, hs, info->pix_fmt))
         return 0;
 
     if (r->has_rga2) {
@@ -757,26 +779,30 @@ static int get_expected_chroma_pitch(enum AVPixelFormat pix_fmt,
                                      ptrdiff_t luma_pitch,
                                      ptrdiff_t *expected_pitch)
 {
-    int is_fully_planar;
+    const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
 
     if (!pix_desc || !expected_pitch || luma_pitch <= 0)
         return AVERROR(EINVAL);
 
-    is_fully_planar = (pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
-                      pix_desc->nb_components >= 3 &&
-                      pix_desc->comp[1].plane != pix_desc->comp[2].plane;
+    if (!row) { /* preserve old else-branch default */
+        *expected_pitch = luma_pitch;
+        return 0;
+    }
 
-    if (is_fully_planar) {
+    switch (row->chroma_mode) {
+    case RGA_CHROMA_SUBW:
         if (luma_pitch % (1 << pix_desc->log2_chroma_w))
             return AVERROR(EINVAL);
         *expected_pitch = luma_pitch >> pix_desc->log2_chroma_w;
-    } else if (pix_fmt == AV_PIX_FMT_NV24 ||
-               pix_fmt == AV_PIX_FMT_NV42) {
+        break;
+    case RGA_CHROMA_DOUBLE:
         if (luma_pitch > INT_MAX / 2)
             return AVERROR(EINVAL);
         *expected_pitch = luma_pitch * 2;
-    } else {
+        break;
+    default: /* RGA_CHROMA_EQUAL and NONE */
         *expected_pitch = luma_pitch;
+        break;
     }
 
     return 0;
