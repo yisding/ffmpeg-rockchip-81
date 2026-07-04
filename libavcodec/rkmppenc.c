@@ -1101,11 +1101,18 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
     switch (avctx->codec_id) {
     case AV_CODEC_ID_H264:
         {
+            /* BASELINE is a CAVLC-only profile; CABAC there yields a
+             * non-conformant stream, so force CAVLC regardless of coder. */
+            int cabac_en = (r->profile == AV_PROFILE_H264_BASELINE) ? 0 : r->coder;
+
             avctx->profile = r->profile;
             avctx->level = r->level;
+            if (r->profile == AV_PROFILE_H264_BASELINE && r->coder)
+                av_log(avctx, AV_LOG_WARNING,
+                       "CABAC is not allowed in the BASELINE profile; using CAVLC\n");
             mpp_enc_cfg_set_s32(cfg, "h264:profile", avctx->profile);
             mpp_enc_cfg_set_s32(cfg, "h264:level", avctx->level);
-            mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", r->coder);
+            mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", cabac_en);
             mpp_enc_cfg_set_s32(cfg, "h264:cabac_idc", 0);
             mpp_enc_cfg_set_s32(cfg, "h264:trans8x8",
                                 (r->dct8x8 && avctx->profile == AV_PROFILE_H264_HIGH));
@@ -1124,7 +1131,7 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
                 break;
             }
             av_log(avctx, AV_LOG_VERBOSE, "Level is set to %d\n", avctx->level);
-            av_log(avctx, AV_LOG_VERBOSE, "Coder is set to %s\n", r->coder ? "CABAC" : "CAVLC");
+            av_log(avctx, AV_LOG_VERBOSE, "Coder is set to %s\n", cabac_en ? "CABAC" : "CAVLC");
         }
         break;
     case AV_CODEC_ID_HEVC:
@@ -1329,12 +1336,13 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
         goto exit;
     }
 
-    /* planar YUV quirks */
+    /* planar YUV quirks: horizontally-subsampled planar formats need an even
+     * width. NV24 is 4:4:4 (no horizontal subsampling), so it is excluded here
+     * just like YUV444P. */
     if ((r->pix_fmt == AV_PIX_FMT_YUV420P ||
          r->pix_fmt == AV_PIX_FMT_YUVJ420P ||
          r->pix_fmt == AV_PIX_FMT_YUV422P ||
-         r->pix_fmt == AV_PIX_FMT_YUVJ422P ||
-         r->pix_fmt == AV_PIX_FMT_NV24) && (drm_frame->width % 2)) {
+         r->pix_fmt == AV_PIX_FMT_YUVJ422P) && (drm_frame->width % 2)) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported width '%d', not 2-aligned\n",
                drm_frame->width);
         *errp = AVERROR(EINVAL);
@@ -1564,12 +1572,19 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     /* freeing MppPacket data in buffer callbacks is not supported in async mode */
     {
         size_t mpp_pkt_length = mpp_packet_get_length(mpp_pkt);
+        void  *mpp_pkt_pos    = mpp_packet_get_pos(mpp_pkt);
 
+        if (!mpp_pkt_length || !mpp_pkt_pos) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid packet from encoder (pos=%p, len=%zu)\n",
+                   mpp_pkt_pos, mpp_pkt_length);
+            ret = AVERROR_EXTERNAL;
+            goto exit;
+        }
         if ((ret = ff_get_encode_buffer(avctx, packet, mpp_pkt_length, 0)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "ff_get_encode_buffer failed: %d\n", ret);
             goto exit;
         }
-        memcpy(packet->data, mpp_packet_get_pos(mpp_pkt), mpp_pkt_length);
+        memcpy(packet->data, mpp_pkt_pos, mpp_pkt_length);
     }
 
     packet->time_base.num = avctx->time_base.num;

@@ -2057,7 +2057,6 @@ EXTERNAL_LIBRARY_VERSION3_LIST="
     libopencore_amrwb
     libvo_amrwbenc
     mbedtls
-    rkmpp
     rkrga
 "
 
