@@ -429,6 +429,9 @@ static av_cold void config_force_format(AVFilterContext *ctx,
 
     switch (force_chroma) {
     case FORCE_CHROMA_422P:
+        if (out_depth == 10)
+            av_log(ctx, AV_LOG_WARNING, "10-bit output is not available for "
+                   "fully-planar 4:2:2; using 8-bit YUV422P\n");
         *out_format = AV_PIX_FMT_YUV422P;
         break;
     case FORCE_CHROMA_422SP:
@@ -436,6 +439,9 @@ static av_cold void config_force_format(AVFilterContext *ctx,
             AV_PIX_FMT_P210 : AV_PIX_FMT_NV16;
         break;
     case FORCE_CHROMA_420P:
+        if (out_depth == 10)
+            av_log(ctx, AV_LOG_WARNING, "10-bit output is not available for "
+                   "fully-planar 4:2:0; using 8-bit YUV420P\n");
         *out_format = AV_PIX_FMT_YUV420P;
         break;
     case FORCE_CHROMA_420SP:
@@ -469,8 +475,11 @@ static av_cold int rgavpp_config_props(AVFilterLink *outlink)
     if (ret < 0)
         return ret;
 
-    config_force_format(ctx, in_format, r->act_w, r->act_h,
-                        outlink->w, outlink->h, &out_format);
+    /* An explicit format= is the most specific request and wins; only derive a
+     * forced output format (from force_yuv/force_chroma) when none was given. */
+    if (r->format == AV_PIX_FMT_NONE)
+        config_force_format(ctx, in_format, r->act_w, r->act_h,
+                            outlink->w, outlink->h, &out_format);
 
     param.filter_frame   = NULL;
     param.out_sw_format  = out_format;
@@ -610,7 +619,7 @@ static const AVOption rgascale_options[] = {
     { "w",  "Output video width",  OFFSET(ow), AV_OPT_TYPE_STRING, { .str = "iw" }, 0, 0, FLAGS },
     { "h",  "Output video height", OFFSET(oh), AV_OPT_TYPE_STRING, { .str = "ih" }, 0, 0, FLAGS },
     { "format", "Output video pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NONE }, INT_MIN, INT_MAX, .flags = FLAGS },
-    { "force_original_aspect_ratio", "Decrease or increase w/h if necessary to keep the original AR", OFFSET(force_original_aspect_ratio), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 2, FLAGS, "force_oar" }, \
+    { "force_original_aspect_ratio", "Decrease or increase w/h if necessary to keep the original AR", OFFSET(force_original_aspect_ratio), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, FLAGS, "force_oar" }, \
         { "disable",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, "force_oar" }, \
         { "decrease", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, "force_oar" }, \
         { "increase", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, FLAGS, "force_oar" }, \
