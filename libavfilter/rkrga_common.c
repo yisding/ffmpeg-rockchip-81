@@ -985,32 +985,6 @@ static void release_frame(RGAFrame *frame)
     frame->locked = 0;
 }
 
-static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
-{
-    const AVHWFramesContext *hwfc;
-
-    if (!frame || !frame->data[0])
-        return NULL;
-
-    /* only RKMPP hwcontext frames carry the extended descriptor: a foreign
-     * DRM_PRIME frame whose descriptor buffer merely happens to be large
-     * enough must not have its trailing bytes read as afbc_offset_y */
-    if (!frame->hw_frames_ctx)
-        return NULL;
-    hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-    if (hwfc->device_ctx->type != AV_HWDEVICE_TYPE_RKMPP)
-        return NULL;
-
-    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
-        if (frame->buf[i] &&
-            frame->buf[i]->data == frame->data[0] &&
-            frame->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor))
-            return (const AVRKMPPDRMFrameDescriptor *)frame->data[0];
-    }
-
-    return NULL;
-}
-
 static RGAFrame *get_free_frame(RGAFrame **list)
 {
     RGAFrame *out = *list;
@@ -1246,7 +1220,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     if (!rga_frame->frame)
         goto fail;
 
-    rkmpp_desc = get_rkmpp_drm_desc(rga_frame->frame);
+    rkmpp_desc = ff_rkmpp_get_drm_desc(rga_frame->frame);
     desc = rkmpp_desc ? &rkmpp_desc->drm_desc :
                         (AVDRMFrameDescriptor *)rga_frame->frame->data[0];
     ret = validate_drm_desc_shape(ctx, desc);

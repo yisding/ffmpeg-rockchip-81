@@ -24,6 +24,8 @@
 #include <drm_fourcc.h>
 #include <rockchip/rk_mpi.h>
 
+#include "frame.h"
+#include "hwcontext.h"
 #include "hwcontext_drm.h"
 
 #ifndef DRM_FORMAT_P010
@@ -78,6 +80,12 @@
 #endif
 
 /**
+ * Marks a DRM frame descriptor as an RKMPP-produced
+ * AVRKMPPDRMFrameDescriptor (stored in the trailing magic field).
+ */
+#define AV_RKMPP_DRM_DESC_MAGIC 0x524B4D50u  /* 'RKMP' */
+
+/**
  * DRM Prime Frame descriptor for RKMPP HWDevice.
  */
 typedef struct AVRKMPPDRMFrameDescriptor {
@@ -97,7 +105,46 @@ typedef struct AVRKMPPDRMFrameDescriptor {
      * presentation cropping.
      */
     int afbc_offset_y;
+
+    /**
+     * Set to AV_RKMPP_DRM_DESC_MAGIC on descriptors produced by RKMPP.
+     * Kept as the last field so appending it does not shift the offsets of
+     * any earlier member; used to distinguish an RKMPP descriptor from a
+     * foreign DRM_PRIME buffer that merely happens to be large enough.
+     */
+    uint32_t magic;
 } AVRKMPPDRMFrameDescriptor;
+
+/**
+ * Return the extended RKMPP descriptor of a frame, or NULL if the frame is
+ * not backed by an RKMPP hwcontext descriptor.
+ *
+ * Only RKMPP hwcontext frames carry the extended descriptor: a foreign
+ * DRM_PRIME frame whose descriptor buffer merely happens to be large enough
+ * must not have its trailing bytes read as afbc_offset_y. The magic field is
+ * only checked after the size gate so it is never read out of bounds.
+ */
+static inline const AVRKMPPDRMFrameDescriptor *ff_rkmpp_get_drm_desc(const AVFrame *frame)
+{
+    const AVHWFramesContext *hwfc;
+
+    if (!frame || !frame->data[0])
+        return NULL;
+
+    if (!frame->hw_frames_ctx)
+        return NULL;
+    hwfc = (const AVHWFramesContext *)frame->hw_frames_ctx->data;
+    if (hwfc->device_ctx->type != AV_HWDEVICE_TYPE_RKMPP)
+        return NULL;
+
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++)
+        if (frame->buf[i] && frame->buf[i]->data == frame->data[0] &&
+            frame->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor) &&
+            ((const AVRKMPPDRMFrameDescriptor *)frame->data[0])->magic == AV_RKMPP_DRM_DESC_MAGIC)
+            return (const AVRKMPPDRMFrameDescriptor *)frame->data[0];
+
+    return NULL;
+}
 
 /**
  * RKMPP-specific data associated with a frame pool.
