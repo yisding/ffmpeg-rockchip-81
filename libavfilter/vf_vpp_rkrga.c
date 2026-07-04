@@ -75,45 +75,18 @@ enum {
     FORCE_CHROMA_NB
 };
 
-static int vpp_rga2_core_mask(int scheduler_core)
-{
-    return scheduler_core && scheduler_core == (scheduler_core & 0xc);
-}
-
-static int vpp_input_forces_rga2(enum AVPixelFormat pix_fmt)
-{
-    switch (pix_fmt) {
-    case AV_PIX_FMT_GRAY8:
-    case AV_PIX_FMT_YUV420P:
-    case AV_PIX_FMT_YUVJ420P:
-    case AV_PIX_FMT_YUV422P:
-    case AV_PIX_FMT_YUVJ422P:
-    case AV_PIX_FMT_RGB555LE:
-    case AV_PIX_FMT_BGR555LE:
-    case AV_PIX_FMT_NV24:
-    case AV_PIX_FMT_NV42:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static int vpp_compact_10bit_input(enum AVPixelFormat pix_fmt)
-{
-    return pix_fmt == AV_PIX_FMT_NV15 ||
-           pix_fmt == AV_PIX_FMT_NV20_PACKED;
-}
-
 static int vpp_output_size_forces_rga2(int width, int height)
 {
     return width > 0 && height > 0 &&
-           (width < 68 || width > 8128 || height < 2 || height > 8128);
+           (width < RKRGA_RGA3_DIM_MIN_W || width > RKRGA_RGA3_OUT_MAX_DIM ||
+            height < RKRGA_RGA3_DIM_MIN_H || height > RKRGA_RGA3_OUT_MAX_DIM);
 }
 
 static int vpp_source_size_forces_rga2(int width, int height)
 {
     return width > 0 && height > 0 &&
-           (width < 68 || width > 8176 || height < 2 || height > 8176);
+           (width < RKRGA_RGA3_DIM_MIN_W || width > RKRGA_RGA3_IN_MAX_DIM ||
+            height < RKRGA_RGA3_DIM_MIN_H || height > RKRGA_RGA3_IN_MAX_DIM);
 }
 
 static int vpp_transpose_swaps_dimensions(int transpose)
@@ -140,8 +113,8 @@ static int vpp_scale_forces_rga2(int src_width, int src_height,
     scale_ratio_w = (float)out_width / (float)src_width;
     scale_ratio_h = (float)out_height / (float)src_height;
 
-    return scale_ratio_w < 0.125f || scale_ratio_w > 8.0f ||
-           scale_ratio_h < 0.125f || scale_ratio_h > 8.0f;
+    return scale_ratio_w < RKRGA_SCALE_RATIO_MIN || scale_ratio_w > RKRGA_SCALE_RATIO_MAX ||
+           scale_ratio_h < RKRGA_SCALE_RATIO_MIN || scale_ratio_h > RKRGA_SCALE_RATIO_MAX;
 }
 
 static const char *const var_names[] = {
@@ -399,14 +372,15 @@ static av_cold void config_force_format(AVFilterContext *ctx,
     has_rga3 = !!strstr(rga_ver, "RGA_3");
     if (has_rga2p)
         rga_core_mask = 0xf;
-    use_rga2_core = vpp_rga2_core_mask(r->rga.scheduler_core) &&
+    use_rga2_core = ff_rkrga_is_rga2_core_mask(r->rga.scheduler_core) &&
                     ((has_rga2 && has_rga3) || has_rga2p) &&
                     r->rga.scheduler_core ==
                     (r->rga.scheduler_core & rga_core_mask);
     use_rga2 = !has_rga3 ||
                use_rga2_core ||
-               vpp_input_forces_rga2(in_format) ||
-               vpp_compact_10bit_input(in_format) ||
+               (ff_rkrga_is_rga2_only_input_format(in_format) ||
+                ff_rkrga_is_rga2pro_only_format(in_format)) ||
+               ff_rkrga_is_compact_10bit_format(in_format) ||
                vpp_source_size_forces_rga2(src_width, src_height) ||
                vpp_output_size_forces_rga2(out_width, out_height) ||
                vpp_scale_forces_rga2(src_width, src_height,
