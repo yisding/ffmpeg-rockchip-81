@@ -30,6 +30,8 @@
 #include "libavutil/mem.h"
 #include "rkmppenc.h"
 
+/* Intentionally not shared with the decoder's rkmpp_get_coding_type():
+ * the encoder only maps its supported H264/HEVC/MJPEG subset. */
 static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
 {
     switch (avctx->codec_id) {
@@ -109,6 +111,8 @@ static MppFrameFormat rkmpp_get_mpp_fmt_mjpeg(enum AVPixelFormat pix_fmt)
     }
 }
 
+/* Intentionally not shared with the decoder's rkmpp_get_drm_afbc_format():
+ * the encoder only handles its 2-format subset. */
 static uint32_t rkmpp_get_drm_afbc_format(MppFrameFormat mpp_fmt)
 {
     switch (mpp_fmt & MPP_FRAME_FMT_MASK) {
@@ -124,6 +128,9 @@ static int rkmpp_is_supported_afbc_modifier(uint64_t modifier)
                                                AFBC_FORMAT_MOD_BLOCK_SIZE_16x16);
 }
 
+/* Intentionally not shared: this switches on AVPixelFormat, while the decoder
+ * copy keys on MppFrameFormat and the hwcontext copy is a table lookup over a
+ * different format set. */
 static uint32_t rkmpp_get_drm_format(enum AVPixelFormat pix_fmt)
 {
     switch (pix_fmt) {
@@ -231,6 +238,10 @@ static int get_byte_stride(const AVDRMObjectDescriptor *object,
     return 0;
 }
 
+/* Intentionally not shared with the decoder's get_afbc_byte_stride():
+ * this is chroma-subsampling-ratio based (early-returns for RGB/packed/single
+ * component, scales planar YUV, both directions); the decoder version is
+ * bpp-based and operates over a disjoint input domain. */
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
                                 int *stride, int reverse)
 {
@@ -732,32 +743,6 @@ static MPPEncFrame *get_free_frame(MPPEncFrame **list)
     return out;
 }
 
-static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
-{
-    const AVHWFramesContext *hwfc;
-
-    if (!frame || !frame->data[0])
-        return NULL;
-
-    /* only RKMPP hwcontext frames carry the extended descriptor: a foreign
-     * DRM_PRIME frame whose descriptor buffer merely happens to be large
-     * enough must not have its trailing bytes read as afbc_offset_y */
-    if (!frame->hw_frames_ctx)
-        return NULL;
-    hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-    if (hwfc->device_ctx->type != AV_HWDEVICE_TYPE_RKMPP)
-        return NULL;
-
-    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
-        if (frame->buf[i] &&
-            frame->buf[i]->data == frame->data[0] &&
-            frame->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor))
-            return (const AVRKMPPDRMFrameDescriptor *)frame->data[0];
-    }
-
-    return NULL;
-}
-
 static int rkmpp_get_valid_afbc_offset_y(AVCodecContext *avctx,
                                          const AVRKMPPDRMFrameDescriptor *rkmpp_desc,
                                          int *afbc_offset_y)
@@ -797,7 +782,7 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR(EINVAL);
 
     drm_desc = (AVDRMFrameDescriptor *)frame->data[0];
-    rkmpp_desc = get_rkmpp_drm_desc(frame);
+    rkmpp_desc = ff_rkmpp_get_drm_desc(frame);
     ret = rkmpp_check_drm_object0(avctx, drm_desc);
     if (ret < 0)
         return ret;
@@ -1325,7 +1310,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     drm_desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
-    rkmpp_desc = get_rkmpp_drm_desc(drm_frame);
+    rkmpp_desc = ff_rkmpp_get_drm_desc(drm_frame);
     ret = rkmpp_check_drm_object0(avctx, drm_desc);
     if (ret < 0) {
         *errp = ret;
