@@ -813,10 +813,14 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     frame->pts    = MPP_PTS_TO_PTS(mpp_frame_get_pts(mpp_frame), avctx->pkt_timebase);
 
     mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
-    if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED)
+    /* Only MPP_FRAME_FLAG_FRAME (0) is progressive; TOP_FIRST (0x4),
+     * BOT_FIRST (0x8) and DEINTERLACED/unknown-order MBAFF (0xC) all denote
+     * interlaced content. Top-field-first is the specific TOP_FIRST value. */
+    if (mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) {
         frame->flags |= AV_FRAME_FLAG_INTERLACED;
-    if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST)
-        frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST)
+            frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+    }
 
     if (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
@@ -1232,8 +1236,14 @@ static int rkmpp_mjpeg_put_packet(AVCodecContext *avctx, MppPacket mpp_pkt_with_
         goto fail;
     }
     if ((ret = mpp_buffer_get(buf_group, &mpp_buf, buf_sz)) != MPP_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get buffer for frame: %d\n", ret);
-        ret = MPP_ERR_UNKNOW;
+        /* an exhausted buffer group is transient back-pressure (the caller is
+         * still holding decoded frames), not a fatal error: preserve
+         * MPP_NOK/MPP_ERR_BUFFER_FULL so rkmpp_send_packet maps it to EAGAIN
+         * instead of the fatal AVERROR_EXTERNAL that MPP_ERR_UNKNOW triggers. */
+        if (ret != MPP_NOK && ret != MPP_ERR_BUFFER_FULL) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to get buffer for frame: %d\n", ret);
+            ret = MPP_ERR_UNKNOW;
+        }
         goto fail;
     }
     if (!mpp_buf) {
@@ -1333,6 +1343,11 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
             }
             pts_diff = (avctx->pkt_timebase.den * framerate.den) /
                        (avctx->pkt_timebase.num * framerate.num);
+            /* a coarse packet timebase (den/num < frame rate) truncates the
+             * per-frame step to 0; force at least one tick so fabricated
+             * timestamps stay monotonic */
+            if (pts_diff < 1)
+                pts_diff = 1;
         }
         /* last_pts is AV_NOPTS_VALUE after a flush: restart fabrication at 0 */
         if (last_pts == AV_NOPTS_VALUE)
@@ -1489,18 +1504,21 @@ static av_cold void rkmpp_decode_flush(AVCodecContext *avctx)
 
     av_log(avctx, AV_LOG_DEBUG, "Decoder flushing\n");
 
-    if ((ret = r->mapi->reset(r->mctx)) == MPP_OK) {
-        r->eof = 0;
-        r->draining = 0;
-        r->info_change = 0;
-        r->got_frame = 0;
-        r->last_pts = AV_NOPTS_VALUE;
-        r->extradata_sent = 0;
-        r->frames_pending = 0;
-
-        av_packet_unref(&r->last_pkt);
-    } else
+    if ((ret = r->mapi->reset(r->mctx)) != MPP_OK)
         av_log(avctx, AV_LOG_ERROR, "Failed to reset MPP context: %d\n", ret);
+
+    /* Reset the decoder-side state unconditionally: even if the MPP reset
+     * failed, leaving r->draining set would make the next receive_frame turn a
+     * transient EAGAIN into a spurious AVERROR_EOF and drop the post-seek stream. */
+    r->eof = 0;
+    r->draining = 0;
+    r->info_change = 0;
+    r->got_frame = 0;
+    r->last_pts = AV_NOPTS_VALUE;
+    r->extradata_sent = 0;
+    r->frames_pending = 0;
+
+    av_packet_unref(&r->last_pkt);
 }
 
 #if CONFIG_H263_RKMPP_DECODER

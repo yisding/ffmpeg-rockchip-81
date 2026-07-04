@@ -244,12 +244,7 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
     desc->drm_desc.nb_layers  = 1;
 
     layer = &desc->drm_desc.layers[0];
-    for (i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++) {
-        if (supported_formats[i].pixfmt == hwfc->sw_format) {
-            layer->format = supported_formats[i].drm_format;
-            break;
-        }
-    }
+    layer->format = rkmpp_get_drm_format(hwfc->sw_format);
     layer->nb_planes = av_pix_fmt_count_planes(hwfc->sw_format);
     layer->planes[0].object_index = 0;
     layer->planes[0].offset = 0;
@@ -588,6 +583,16 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     return 0;
 
 fail:
+#if HAVE_LINUX_DMA_BUF_H
+    /* balance the DMA_BUF_SYNC_START issued for every already-processed object
+     * (address[i] set), mirroring rkmpp_unmap_frame's SYNC_END */
+    if (map->buffer_flags & MPP_BUFFER_FLAGS_CACHABLE) {
+        struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | map->sync_flags };
+        for (i = 0; i < desc->drm_desc.nb_objects; i++)
+            if (map->address[i])
+                ioctl(map->object[i], DMA_BUF_IOCTL_SYNC, &sync_end);
+    }
+#endif
     for (i = 0; i < desc->drm_desc.nb_objects; i++) {
         if (map->address[i] && map->unmap[i])
             munmap(map->address[i], map->length[i]);
@@ -625,7 +630,10 @@ static int rkmpp_transfer_data_from(AVHWFramesContext *hwfc,
     map = av_frame_alloc();
     if (!map)
         return AVERROR(ENOMEM);
-    map->format = dst->format;
+    /* rkmpp_map_frame lays the planes out per hwfc->sw_format; tagging the map
+     * with sw_format makes av_frame_copy reject a peer of a different format with
+     * EINVAL instead of walking a mismatched plane layout and crashing. */
+    map->format = hwfc->sw_format;
 
     err = rkmpp_map_frame(hwfc, map, src, AV_HWFRAME_MAP_READ);
     if (err)
@@ -656,7 +664,9 @@ static int rkmpp_transfer_data_to(AVHWFramesContext *hwfc,
     map = av_frame_alloc();
     if (!map)
         return AVERROR(ENOMEM);
-    map->format = src->format;
+    /* see rkmpp_transfer_data_from: the mapped frame follows the hw sw_format
+     * layout, so tag it as such to get a clean EINVAL on a format mismatch. */
+    map->format = hwfc->sw_format;
 
     err = rkmpp_map_frame(hwfc, map, dst, AV_HWFRAME_MAP_WRITE |
                                           AV_HWFRAME_MAP_OVERWRITE);

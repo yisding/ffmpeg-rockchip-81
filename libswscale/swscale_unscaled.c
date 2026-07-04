@@ -249,13 +249,18 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
 {
     const AVPixFmtDescriptor *src_format = av_pix_fmt_desc_get(c->opts.src_format);
     const AVPixFmtDescriptor *dst_format = av_pix_fmt_desc_get(c->opts.dst_format);
-    int vsub = 1 << dst_format->log2_chroma_h;
+    /* the number of chroma rows to read comes from the source subsampling,
+     * while the destination chroma plane is positioned by the dest subsampling;
+     * these are equal for the currently-registered 4:2:0->4:2:0 pairs but must
+     * not be conflated if a chroma-height-mismatched pair is ever added. */
+    int vsub_src = 1 << src_format->log2_chroma_h;
+    int vsub_dst = 1 << dst_format->log2_chroma_h;
     uint16_t *dstY = (uint16_t*)(dstParam[0] + dstStride[0] * srcSliceY);
-    uint16_t *dstU = (uint16_t*)(dstParam[1] + dstStride[1] * srcSliceY / vsub);
-    uint16_t *dstV = (uint16_t*)(dstParam[2] + dstStride[2] * srcSliceY / vsub);
+    uint16_t *dstU = (uint16_t*)(dstParam[1] + dstStride[1] * srcSliceY / vsub_dst);
+    uint16_t *dstV = (uint16_t*)(dstParam[2] + dstStride[2] * srcSliceY / vsub_dst);
     const uint8_t *srcY = src[0];
     const uint8_t *srcUV = src[1];
-    int chrSrcSliceH = (srcSliceH + vsub - 1) / vsub;
+    int chrSrcSliceH = (srcSliceH + vsub_src - 1) / vsub_src;
     int x, y;
 
     /* Calculate net shift required for values. */
