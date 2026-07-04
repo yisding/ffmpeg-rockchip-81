@@ -130,6 +130,19 @@ typedef struct RKRGAParam {
     int overlay_y;
 } RKRGAParam;
 
+#define RKRGA_RGA3_DIM_MIN_W      68
+#define RKRGA_RGA3_DIM_MIN_H      2
+#define RKRGA_RGA3_IN_MAX_DIM     8176
+#define RKRGA_RGA3_OUT_MAX_DIM    8128
+#define RKRGA_RGA2_NONPRO_MAX_DIM 4096
+#define RKRGA_SCALE_RATIO_MIN     0.125f
+#define RKRGA_SCALE_RATIO_MAX     8.0f
+
+int ff_rkrga_is_rga2_only_input_format(enum AVPixelFormat pix_fmt);
+int ff_rkrga_is_rga2pro_only_format(enum AVPixelFormat pix_fmt);
+int ff_rkrga_is_compact_10bit_format(enum AVPixelFormat pix_fmt);
+int ff_rkrga_is_rga2_core_mask(int scheduler_core);
+
 int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param);
 int ff_rkrga_close(AVFilterContext *avctx);
 int ff_rkrga_filter_frame(RKRGAContext *r,
