@@ -1077,8 +1077,15 @@ static int set_colorspace_info(AVFilterContext *avctx,
                     *out_spc = AVCOL_SPC_BT709;
                 if (out_rng)
                     *out_rng = AVCOL_RANGE_MPEG;
-                out_mode = is_rga2_used ? (0xb << 8) /* rgb2yuv_709_limit */
-                                        : (3 << 2);  /* IM_RGB_TO_YUV_BT709_LIMIT */
+                /* IM_RGB_TO_YUV_BT709_LIMIT. librga's rga_task_prepare() extracts
+                 * this legacy const CSC mode and calls rga_convert_legacy_*_csc_mode(),
+                 * which sets the per-buffer full-CSC color spaces and auto-promotes to
+                 * full CSC on RGA2. The old RGA2 branch wrote the legacy rga.h magic
+                 * 0xb<<8 (rgb2yuv_709_limit), which is not a valid im2d color-space
+                 * mode: it has no IM_LEGACY_CSC_MASK bits, so it bypasses that
+                 * conversion and is rejected by rga_check_color_space() as
+                 * IM_STATUS_NOT_SUPPORTED, failing every such frame on RGA2. */
+                out_mode = 3 << 2;
             }
         }
         if (out_mode)

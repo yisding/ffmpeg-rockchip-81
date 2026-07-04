@@ -942,8 +942,19 @@ static int validate_multiplanar_raw_layout(AVFormatContext *ctx,
             fmt.fmt.pix.sizeimage >= s->frame_size) {
             s->raw_plane_count = 1;
             s->raw_plane_size[0] = s->frame_size;
+            return 0;
         }
-        return 0;
+
+        /* A padded bytesperline can't be undone by end-truncation of a single
+         * contiguous buffer, and leaving raw_plane_count at 0 would make every
+         * frame fail the frame_size check and be emitted empty. Reject it
+         * explicitly, matching the single-plane MPLANE path below. */
+        av_log(ctx, AV_LOG_ERROR,
+               "Unsupported padded single-plane raw layout: "
+               "bytesperline=%u sizeimage=%u expected bytesperline=%d min sizeimage=%d\n",
+               fmt.fmt.pix.bytesperline, fmt.fmt.pix.sizeimage,
+               image_linesizes[0], s->frame_size);
+        return AVERROR(ENOSYS);
     }
 
     if (fmt.fmt.pix_mp.num_planes == 1) {
