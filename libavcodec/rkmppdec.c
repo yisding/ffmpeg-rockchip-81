@@ -918,260 +918,268 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
 {
     RKMPPDecContext *r = avctx->priv_data;
     MppFrame mpp_frame = NULL;
-    int ret, corrupt = 0;
+    int ret = 0, corrupt = 0;
 
-    /* should not provide any frame after EOS */
-    if (r->eof)
-        return AVERROR_EOF;
+    for (;;) {
+        mpp_frame = NULL;
+        corrupt   = 0;
 
-    /* the MJPEG decoder is 1-in-1-out and never signals an EOS frame:
-     * a blocking drain poll would wait forever once the queue is empty,
-     * but a non-blocking one would drop frames still being decoded */
-    if (avctx->codec_id == AV_CODEC_ID_MJPEG && timeout == MPP_TIMEOUT_BLOCK)
-        timeout = r->frames_pending > 0 ? MPP_TIMEOUT_MAX
-                                        : MPP_TIMEOUT_NON_BLOCK;
+        /* should not provide any frame after EOS */
+        if (r->eof)
+            return AVERROR_EOF;
 
-    if ((ret = r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout)) != MPP_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to set output timeout: %d\n", ret);
-        return AVERROR_EXTERNAL;
-    }
+        /* the MJPEG decoder is 1-in-1-out and never signals an EOS frame:
+         * a blocking drain poll would wait forever once the queue is empty,
+         * but a non-blocking one would drop frames still being decoded */
+        if (avctx->codec_id == AV_CODEC_ID_MJPEG && timeout == MPP_TIMEOUT_BLOCK)
+            timeout = r->frames_pending > 0 ? MPP_TIMEOUT_MAX
+                                            : MPP_TIMEOUT_NON_BLOCK;
 
-    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
-        ret = rkmpp_mjpeg_get_frame(avctx, &mpp_frame, timeout);
-    else
-        ret = r->mapi->decode_get_frame(r->mctx, &mpp_frame);
-
-    if (ret != MPP_OK && ret != MPP_NOK && ret != MPP_ERR_TIMEOUT) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get frame (timeout: %d): %d\n", timeout, ret);
-        return AVERROR_EXTERNAL;
-    }
-
-    if (!mpp_frame) {
-        if (timeout != MPP_TIMEOUT_NON_BLOCK)
-            av_log(avctx, AV_LOG_DEBUG, "Timeout getting decoded frame\n");
-        return AVERROR(EAGAIN);
-    }
-    if (avctx->codec_id == AV_CODEC_ID_MJPEG && r->frames_pending > 0)
-        r->frames_pending--;
-    if (mpp_frame_get_eos(mpp_frame)) {
-        av_log(avctx, AV_LOG_DEBUG, "Received a 'EOS' frame\n");
-        /* MPP signals EOS only once: remember it even when the EOS frame
-         * carries valid data, otherwise the next drain call would block
-         * forever waiting for a frame that never arrives */
-        r->eof = 1;
-        /* EOS frame may contain valid data */
-        if (!mpp_frame_get_buffer(mpp_frame)) {
-            ret = AVERROR_EOF;
-            goto exit;
+        if ((ret = r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout)) != MPP_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to set output timeout: %d\n", ret);
+            return AVERROR_EXTERNAL;
         }
-    }
-    if (mpp_frame_get_discard(mpp_frame)) {
-        av_log(avctx, AV_LOG_DEBUG, "Received a 'discard' frame\n");
-        /* during draining decodable frames may still be queued behind the
-         * discarded one: retry, otherwise the caller would turn the EAGAIN
-         * into a premature EOF */
-        if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
-            mpp_frame_deinit(&mpp_frame);
-            return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_MAX);
-        }
-        ret = AVERROR(EAGAIN);
-        goto exit;
-    }
-    if (ret = mpp_frame_get_errinfo(mpp_frame)) {
-        int explode = avctx->err_recognition & AV_EF_EXPLODE;
-        int ignore_err = !explode &&
-                         ((avctx->codec_id != AV_CODEC_ID_MJPEG) ||
-                          (avctx->err_recognition & AV_EF_IGNORE_ERR));
-        int log_level = ignore_err ? AV_LOG_WARNING : AV_LOG_ERROR;
 
-        av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
         if (avctx->codec_id == AV_CODEC_ID_MJPEG)
-            av_log(avctx, log_level, "The YCbCr format may not be supported. Supported: "
-                   "YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | YUV444(1*1:1*1:1*1)\n");
-        if (explode) {
-            ret = AVERROR_INVALIDDATA;
-            goto exit;
+            ret = rkmpp_mjpeg_get_frame(avctx, &mpp_frame, timeout);
+        else
+            ret = r->mapi->decode_get_frame(r->mctx, &mpp_frame);
+
+        if (ret != MPP_OK && ret != MPP_NOK && ret != MPP_ERR_TIMEOUT) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to get frame (timeout: %d): %d\n", timeout, ret);
+            return AVERROR_EXTERNAL;
         }
-        if (!ignore_err) {
-            /* surface the error for this frame only; latching EOF here would
-             * permanently end streams (e.g. live MJPEG capture) whose later
-             * frames are still decodable */
-            ret = AVERROR_INVALIDDATA;
-            goto exit;
+
+        if (!mpp_frame) {
+            if (timeout != MPP_TIMEOUT_NON_BLOCK)
+                av_log(avctx, AV_LOG_DEBUG, "Timeout getting decoded frame\n");
+            return AVERROR(EAGAIN);
         }
-        /* return decodable frames flagged as corrupt, drop buffer-less ones */
-        if (!mpp_frame_get_buffer(mpp_frame)) {
+        if (avctx->codec_id == AV_CODEC_ID_MJPEG && r->frames_pending > 0)
+            r->frames_pending--;
+        if (mpp_frame_get_eos(mpp_frame)) {
+            av_log(avctx, AV_LOG_DEBUG, "Received a 'EOS' frame\n");
+            /* MPP signals EOS only once: remember it even when the EOS frame
+             * carries valid data, otherwise the next drain call would block
+             * forever waiting for a frame that never arrives */
+            r->eof = 1;
+            /* EOS frame may contain valid data */
+            if (!mpp_frame_get_buffer(mpp_frame)) {
+                ret = AVERROR_EOF;
+                goto exit;
+            }
+        }
+        if (mpp_frame_get_discard(mpp_frame)) {
+            av_log(avctx, AV_LOG_DEBUG, "Received a 'discard' frame\n");
+            /* during draining decodable frames may still be queued behind the
+             * discarded one: retry, otherwise the caller would turn the EAGAIN
+             * into a premature EOF */
             if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
                 mpp_frame_deinit(&mpp_frame);
-                return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_MAX);
+                timeout = MPP_TIMEOUT_MAX;
+                continue;
             }
             ret = AVERROR(EAGAIN);
             goto exit;
         }
-        corrupt = 1;
-    }
+        if (ret = mpp_frame_get_errinfo(mpp_frame)) {
+            int explode = avctx->err_recognition & AV_EF_EXPLODE;
+            int ignore_err = !explode &&
+                             ((avctx->codec_id != AV_CODEC_ID_MJPEG) ||
+                              (avctx->err_recognition & AV_EF_IGNORE_ERR));
+            int log_level = ignore_err ? AV_LOG_WARNING : AV_LOG_ERROR;
 
-    if ((r->info_change = mpp_frame_get_info_change(mpp_frame)) ||
-        (avctx->codec_id == AV_CODEC_ID_MJPEG && !r->buf_group)) {
-        char *opts = NULL;
-        int fast_parse = r->fast_parse;
-        int mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
-        const MppFrameFormat mpp_fmt = mpp_frame_get_fmt(mpp_frame);
-        enum AVPixelFormat pix_fmts[3] = { AV_PIX_FMT_DRM_PRIME,
-                                           AV_PIX_FMT_NONE,
-                                           AV_PIX_FMT_NONE };
-
-        av_log(avctx, AV_LOG_VERBOSE, "Noticed an info change\n");
-
-        if (r->afbc && !(mpp_fmt & MPP_FRAME_FBC_MASK)) {
-            av_log(avctx, AV_LOG_VERBOSE, "AFBC is requested but not supported\n");
-            r->afbc = 0;
-        }
-
-        pix_fmts[1] = rkmpp_get_av_format(mpp_fmt & MPP_FRAME_FMT_MASK);
-
-        if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME)
-            avctx->sw_pix_fmt = pix_fmts[1];
-        else {
-            if ((ret = ff_get_format(avctx, pix_fmts)) < 0)
+            av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
+            if (avctx->codec_id == AV_CODEC_ID_MJPEG)
+                av_log(avctx, log_level, "The YCbCr format may not be supported. Supported: "
+                       "YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | YUV444(1*1:1*1:1*1)\n");
+            if (explode) {
+                ret = AVERROR_INVALIDDATA;
                 goto exit;
-            avctx->pix_fmt = ret;
+            }
+            if (!ignore_err) {
+                /* surface the error for this frame only; latching EOF here would
+                 * permanently end streams (e.g. live MJPEG capture) whose later
+                 * frames are still decodable */
+                ret = AVERROR_INVALIDDATA;
+                goto exit;
+            }
+            /* return decodable frames flagged as corrupt, drop buffer-less ones */
+            if (!mpp_frame_get_buffer(mpp_frame)) {
+                if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
+                    mpp_frame_deinit(&mpp_frame);
+                    timeout = MPP_TIMEOUT_MAX;
+                    continue;
+                }
+                ret = AVERROR(EAGAIN);
+                goto exit;
+            }
+            corrupt = 1;
         }
 
-        avctx->width        = mpp_frame_get_width(mpp_frame);
-        avctx->height       = mpp_frame_get_height(mpp_frame);
-        avctx->coded_width  = FFALIGN(avctx->width,  64);
-        avctx->coded_height = FFALIGN(avctx->height, 64);
-        rkmpp_export_avctx_color_props(avctx, mpp_frame);
+        if ((r->info_change = mpp_frame_get_info_change(mpp_frame)) ||
+            (avctx->codec_id == AV_CODEC_ID_MJPEG && !r->buf_group)) {
+            char *opts = NULL;
+            int fast_parse = r->fast_parse;
+            int mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
+            const MppFrameFormat mpp_fmt = mpp_frame_get_fmt(mpp_frame);
+            enum AVPixelFormat pix_fmts[3] = { AV_PIX_FMT_DRM_PRIME,
+                                               AV_PIX_FMT_NONE,
+                                               AV_PIX_FMT_NONE };
 
-        if (r->afbc == RKMPP_DEC_AFBC_ON_RGA &&
-            !rkmpp_afbc_rga_supported(avctx->width, avctx->height,
-                                      pix_fmts[1], NULL)) {
-            MppFrameFormat output_fmt = MPP_FRAME_FBC_NONE;
+            av_log(avctx, AV_LOG_VERBOSE, "Noticed an info change\n");
 
-            av_log(avctx, AV_LOG_VERBOSE,
-                   "AFBC is requested without capable RGA for %dx%d %s, disabling\n",
+            if (r->afbc && !(mpp_fmt & MPP_FRAME_FBC_MASK)) {
+                av_log(avctx, AV_LOG_VERBOSE, "AFBC is requested but not supported\n");
+                r->afbc = 0;
+            }
+
+            pix_fmts[1] = rkmpp_get_av_format(mpp_fmt & MPP_FRAME_FMT_MASK);
+
+            if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME)
+                avctx->sw_pix_fmt = pix_fmts[1];
+            else {
+                if ((ret = ff_get_format(avctx, pix_fmts)) < 0)
+                    goto exit;
+                avctx->pix_fmt = ret;
+            }
+
+            avctx->width        = mpp_frame_get_width(mpp_frame);
+            avctx->height       = mpp_frame_get_height(mpp_frame);
+            avctx->coded_width  = FFALIGN(avctx->width,  64);
+            avctx->coded_height = FFALIGN(avctx->height, 64);
+            rkmpp_export_avctx_color_props(avctx, mpp_frame);
+
+            if (r->afbc == RKMPP_DEC_AFBC_ON_RGA &&
+                !rkmpp_afbc_rga_supported(avctx->width, avctx->height,
+                                          pix_fmts[1], NULL)) {
+                MppFrameFormat output_fmt = MPP_FRAME_FBC_NONE;
+
+                av_log(avctx, AV_LOG_VERBOSE,
+                       "AFBC is requested without capable RGA for %dx%d %s, disabling\n",
+                       avctx->width, avctx->height,
+                       av_get_pix_fmt_name(pix_fmts[1]));
+                r->afbc = RKMPP_DEC_AFBC_OFF;
+
+                ret = r->mapi->control(r->mctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_fmt);
+                if (ret != MPP_OK) {
+                    av_log(avctx, AV_LOG_ERROR, "Failed to disable FBC mode: %d\n", ret);
+                    ret = AVERROR_EXTERNAL;
+                    goto exit;
+                }
+            }
+
+            if (av_opt_serialize(r, 0, 0, &opts, '=', ' ') >= 0)
+                av_log(avctx, AV_LOG_VERBOSE, "Decoder options: %s\n", opts);
+            av_freep(&opts);
+
+            av_log(avctx, AV_LOG_VERBOSE, "Configured with size: %dx%d | pix_fmt: %s | sw_pix_fmt: %s\n",
                    avctx->width, avctx->height,
-                   av_get_pix_fmt_name(pix_fmts[1]));
-            r->afbc = RKMPP_DEC_AFBC_OFF;
+                   av_get_pix_fmt_name(avctx->pix_fmt),
+                   av_get_pix_fmt_name(avctx->sw_pix_fmt));
 
-            ret = r->mapi->control(r->mctx, MPP_DEC_SET_OUTPUT_FORMAT, &output_fmt);
-            if (ret != MPP_OK) {
-                av_log(avctx, AV_LOG_ERROR, "Failed to disable FBC mode: %d\n", ret);
+            if ((ret = rkmpp_set_buffer_group(avctx, pix_fmts[1], avctx->width, avctx->height)) < 0)
+                goto exit;
+
+            /* Disable fast parsing for the interlaced video */
+            if (((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED ||
+                 (mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST) && fast_parse) {
+                av_log(avctx, AV_LOG_VERBOSE, "Fast parsing is disabled for the interlaced video\n");
+                fast_parse = 0;
+            }
+            if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_PARSER_FAST_MODE, &fast_parse)) != MPP_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to set parser fast mode: %d\n", ret);
                 ret = AVERROR_EXTERNAL;
                 goto exit;
             }
-        }
 
-        if (av_opt_serialize(r, 0, 0, &opts, '=', ' ') >= 0)
-            av_log(avctx, AV_LOG_VERBOSE, "Decoder options: %s\n", opts);
-        av_freep(&opts);
-
-        av_log(avctx, AV_LOG_VERBOSE, "Configured with size: %dx%d | pix_fmt: %s | sw_pix_fmt: %s\n",
-               avctx->width, avctx->height,
-               av_get_pix_fmt_name(avctx->pix_fmt),
-               av_get_pix_fmt_name(avctx->sw_pix_fmt));
-
-        if ((ret = rkmpp_set_buffer_group(avctx, pix_fmts[1], avctx->width, avctx->height)) < 0)
-            goto exit;
-
-        /* Disable fast parsing for the interlaced video */
-        if (((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED ||
-             (mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST) && fast_parse) {
-            av_log(avctx, AV_LOG_VERBOSE, "Fast parsing is disabled for the interlaced video\n");
-            fast_parse = 0;
-        }
-        if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_PARSER_FAST_MODE, &fast_parse)) != MPP_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set parser fast mode: %d\n", ret);
-            ret = AVERROR_EXTERNAL;
-            goto exit;
-        }
-
-        if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL)) != MPP_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set info change ready: %d\n", ret);
-            ret = AVERROR_EXTERNAL;
-            goto exit;
-        }
-
-        /* there's no real info change, export the frame directly */
-        if (avctx->codec_id == AV_CODEC_ID_MJPEG)
-            goto export;
-
-        /* no more new pkts after EOS, retry to get frame */
-        if (r->draining) {
-            mpp_frame_deinit(&mpp_frame);
-            return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_MAX);
-        }
-        ret = AVERROR(EAGAIN);
-        goto exit;
-    } else {
-export:
-        av_log(avctx, AV_LOG_DEBUG, "Received a frame\n");
-        r->got_frame = 1;
-        /* colorimetry may change mid-stream without an info-change event */
-        rkmpp_export_avctx_color_props(avctx, mpp_frame);
-
-        switch (avctx->pix_fmt) {
-        case AV_PIX_FMT_DRM_PRIME:
-            {
-                ret = rkmpp_export_frame(avctx, frame, mpp_frame);
-                mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
-                if (ret < 0)
-                    goto exit;
-                if (corrupt) {
-                    frame->flags |= AV_FRAME_FLAG_CORRUPT;
-                    frame->decode_error_flags |= FF_DECODE_ERROR_CONCEALMENT_ACTIVE;
-                }
-                return 0;
-            }
-            break;
-        case AV_PIX_FMT_NV12:
-        case AV_PIX_FMT_NV16:
-        case AV_PIX_FMT_NV24:
-        case AV_PIX_FMT_NV15:
-        case AV_PIX_FMT_NV20_PACKED:
-            {
-                AVFrame *tmp_frame = av_frame_alloc();
-                if (!tmp_frame) {
-                    ret = AVERROR(ENOMEM);
-                    goto exit;
-                }
-                ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame);
-                mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
-                if (ret < 0) {
-                    av_frame_free(&tmp_frame);
-                    goto exit;
-                }
-
-                if ((ret = ff_get_buffer(avctx, frame, 0)) < 0) {
-                    av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed: %d\n", ret);
-                    av_frame_free(&tmp_frame);
-                    goto exit;
-                }
-                if ((ret = av_hwframe_transfer_data(frame, tmp_frame, 0)) < 0) {
-                    av_log(avctx, AV_LOG_ERROR, "av_hwframe_transfer_data failed: %d\n", ret);
-                    av_frame_free(&tmp_frame);
-                    goto exit;
-                }
-                if ((ret = av_frame_copy_props(frame, tmp_frame)) < 0) {
-                    av_log(avctx, AV_LOG_ERROR, "av_frame_copy_props failed: %d\n", ret);
-                    av_frame_free(&tmp_frame);
-                    goto exit;
-                }
-                av_frame_free(&tmp_frame);
-                if (corrupt) {
-                    frame->flags |= AV_FRAME_FLAG_CORRUPT;
-                    frame->decode_error_flags |= FF_DECODE_ERROR_CONCEALMENT_ACTIVE;
-                }
-                return 0;
-            }
-            break;
-        default:
-            {
-                ret = AVERROR_BUG;
+            if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL)) != MPP_OK) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to set info change ready: %d\n", ret);
+                ret = AVERROR_EXTERNAL;
                 goto exit;
             }
-            break;
+
+            /* there's no real info change, export the frame directly */
+            if (avctx->codec_id == AV_CODEC_ID_MJPEG)
+                goto export;
+
+            /* no more new pkts after EOS, retry to get frame */
+            if (r->draining) {
+                mpp_frame_deinit(&mpp_frame);
+                timeout = MPP_TIMEOUT_MAX;
+                continue;
+            }
+            ret = AVERROR(EAGAIN);
+            goto exit;
+        } else {
+export:
+            av_log(avctx, AV_LOG_DEBUG, "Received a frame\n");
+            r->got_frame = 1;
+            /* colorimetry may change mid-stream without an info-change event */
+            rkmpp_export_avctx_color_props(avctx, mpp_frame);
+
+            switch (avctx->pix_fmt) {
+            case AV_PIX_FMT_DRM_PRIME:
+                {
+                    ret = rkmpp_export_frame(avctx, frame, mpp_frame);
+                    mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
+                    if (ret < 0)
+                        goto exit;
+                    if (corrupt) {
+                        frame->flags |= AV_FRAME_FLAG_CORRUPT;
+                        frame->decode_error_flags |= FF_DECODE_ERROR_CONCEALMENT_ACTIVE;
+                    }
+                    return 0;
+                }
+                break;
+            case AV_PIX_FMT_NV12:
+            case AV_PIX_FMT_NV16:
+            case AV_PIX_FMT_NV24:
+            case AV_PIX_FMT_NV15:
+            case AV_PIX_FMT_NV20_PACKED:
+                {
+                    AVFrame *tmp_frame = av_frame_alloc();
+                    if (!tmp_frame) {
+                        ret = AVERROR(ENOMEM);
+                        goto exit;
+                    }
+                    ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame);
+                    mpp_frame = NULL; /* consumed by rkmpp_export_frame even on failure */
+                    if (ret < 0) {
+                        av_frame_free(&tmp_frame);
+                        goto exit;
+                    }
+
+                    if ((ret = ff_get_buffer(avctx, frame, 0)) < 0) {
+                        av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed: %d\n", ret);
+                        av_frame_free(&tmp_frame);
+                        goto exit;
+                    }
+                    if ((ret = av_hwframe_transfer_data(frame, tmp_frame, 0)) < 0) {
+                        av_log(avctx, AV_LOG_ERROR, "av_hwframe_transfer_data failed: %d\n", ret);
+                        av_frame_free(&tmp_frame);
+                        goto exit;
+                    }
+                    if ((ret = av_frame_copy_props(frame, tmp_frame)) < 0) {
+                        av_log(avctx, AV_LOG_ERROR, "av_frame_copy_props failed: %d\n", ret);
+                        av_frame_free(&tmp_frame);
+                        goto exit;
+                    }
+                    av_frame_free(&tmp_frame);
+                    if (corrupt) {
+                        frame->flags |= AV_FRAME_FLAG_CORRUPT;
+                        frame->decode_error_flags |= FF_DECODE_ERROR_CONCEALMENT_ACTIVE;
+                    }
+                    return 0;
+                }
+                break;
+            default:
+                {
+                    ret = AVERROR_BUG;
+                    goto exit;
+                }
+                break;
+            }
         }
     }
 
