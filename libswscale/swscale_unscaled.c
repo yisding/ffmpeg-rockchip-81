@@ -251,8 +251,9 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src[],
     const AVPixFmtDescriptor *dst_format = av_pix_fmt_desc_get(c->opts.dst_format);
     /* the number of chroma rows to read comes from the source subsampling,
      * while the destination chroma plane is positioned by the dest subsampling;
-     * these are equal for the currently-registered 4:2:0->4:2:0 pairs but must
-     * not be conflated if a chroma-height-mismatched pair is ever added. */
+     * these are equal for the currently-registered 4:2:0->4:2:0 and
+     * 4:2:2->4:2:2 pairs but must not be conflated if a chroma-height-mismatched
+     * pair is ever added. */
     int vsub_src = 1 << src_format->log2_chroma_h;
     int vsub_dst = 1 << dst_format->log2_chroma_h;
     uint16_t *dstY = (uint16_t*)(dstParam[0] + dstStride[0] * srcSliceY);
@@ -2489,12 +2490,17 @@ void ff_get_unscaled_swscale(SwsInternal *c)
         (srcFormat == AV_PIX_FMT_NV24 || srcFormat == AV_PIX_FMT_NV42)) {
         c->convert_unscaled = nv24ToPlanarWrapper;
     }
-    /* nv15_to_yuv420p1x */
+    /* nv15_to_yuv420p1x / nv20_to_yuv422p1x */
     if ((srcFormat == AV_PIX_FMT_NV15 &&
          (dstFormat == AV_PIX_FMT_YUV420P10 ||
           dstFormat == AV_PIX_FMT_YUV420P12 ||
           dstFormat == AV_PIX_FMT_YUV420P14 ||
-          dstFormat == AV_PIX_FMT_YUV420P16))) {
+          dstFormat == AV_PIX_FMT_YUV420P16)) ||
+        (srcFormat == AV_PIX_FMT_NV20_PACKED &&
+         (dstFormat == AV_PIX_FMT_YUV422P10 ||
+          dstFormat == AV_PIX_FMT_YUV422P12 ||
+          dstFormat == AV_PIX_FMT_YUV422P14 ||
+          dstFormat == AV_PIX_FMT_YUV422P16))) {
         c->convert_unscaled = nv15_20ToPlanarWrapper;
     }
     /* yuv2bgr */
