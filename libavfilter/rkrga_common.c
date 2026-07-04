@@ -1399,6 +1399,31 @@ fail:
     return NULL;
 }
 
+static int query_out_frame_strides(AVFilterContext *ctx,
+                                   const AVDRMObjectDescriptor *object,
+                                   const AVDRMLayerDescriptor *layer,
+                                   RGAFrameInfo *out_info,
+                                   RGAFrameInfo *validate_out_info,
+                                   int is_afbc, int frame_w, int frame_h,
+                                   int *w_stride, int *h_stride)
+{
+    int ret;
+    if (!is_afbc) {
+        ret = get_pixel_stride(object, layer, out_info->pix_fmt,
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
+                               frame_w, frame_h, w_stride, h_stride);
+        if (ret < 0 || !*w_stride || !*h_stride) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
+            return ret < 0 ? ret : AVERROR(EINVAL);
+        }
+    }
+    ret = validate_active_rect_stride(ctx, validate_out_info, *w_stride, *h_stride, "Output");
+    if (ret < 0)
+        return ret;
+    return validate_rga3_pixel_stride(ctx, validate_out_info, out_info, *w_stride, *h_stride, "Output");
+}
+
 static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                              const AVFrame *in, const AVFrame *picref_pat, int pat_preproc)
 {
@@ -1551,45 +1576,14 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                     frame_w, frame_h);
     if (ret < 0)
         goto fail;
-    if (!is_afbc) {
-        ret = get_pixel_stride(object,
-                               layer,
-                               out_info->pix_fmt,
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               frame_w, frame_h, &w_stride, &h_stride);
-        if (ret < 0 || !w_stride || !h_stride) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
-            goto fail;
-        }
-    }
-
-    ret = validate_active_rect_stride(ctx, &validate_out_info,
-                                      w_stride, h_stride, "Output");
-    if (ret < 0)
-        goto fail;
-    ret = validate_rga3_pixel_stride(ctx, &validate_out_info, out_info,
-                                     w_stride, h_stride, "Output");
+    ret = query_out_frame_strides(ctx, object, layer, out_info, &validate_out_info,
+                                  is_afbc, frame_w, frame_h, &w_stride, &h_stride);
     if (ret < 0)
         goto fail;
     if (ret > 0 && is_afbc) {
         is_afbc = r->afbc_out = 0;
-        ret = get_pixel_stride(object,
-                               layer,
-                               out_info->pix_fmt,
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               frame_w, frame_h, &w_stride, &h_stride);
-        if (ret < 0 || !w_stride || !h_stride) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
-            goto fail;
-        }
-        ret = validate_active_rect_stride(ctx, &validate_out_info,
-                                          w_stride, h_stride, "Output");
-        if (ret < 0)
-            goto fail;
-        ret = validate_rga3_pixel_stride(ctx, &validate_out_info, out_info,
-                                         w_stride, h_stride, "Output");
+        ret = query_out_frame_strides(ctx, object, layer, out_info, &validate_out_info,
+                                      is_afbc, frame_w, frame_h, &w_stride, &h_stride);
         if (ret < 0)
             goto fail;
     }
