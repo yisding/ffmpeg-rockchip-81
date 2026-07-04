@@ -96,6 +96,9 @@ static const struct {
     { AV_PIX_FMT_X2BGR10BE, DRM_FORMAT_XBGR2101010 | DRM_FORMAT_BIG_ENDIAN, },
 };
 
+/* Intentionally not shared: this is a table lookup over supported_formats
+ * keyed on AVPixelFormat; the decoder/encoder rkmpp_get_drm_format() copies
+ * are switch statements over different format sets. */
 static uint32_t rkmpp_get_drm_format(enum AVPixelFormat pix_fmt)
 {
     for (int i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++)
@@ -239,6 +242,7 @@ static AVBufferRef *rkmpp_drm_pool_alloc(void *opaque, size_t size)
     desc = av_mallocz(sizeof(*desc));
     if (!desc)
         return NULL;
+    desc->magic = AV_RKMPP_DRM_DESC_MAGIC;
 
     desc->drm_desc.nb_objects = 1;
     desc->drm_desc.nb_layers  = 1;
@@ -490,7 +494,6 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     RKMPPDRMMapping *map;
     int err, i, p, plane;
     int mmap_prot;
-    int have_mpp_buffers = 0;
     void *addr;
 
     err = rkmpp_validate_drm_descriptor(hwfc, desc);
@@ -500,14 +503,7 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     /* the MppBuffer pointers live past the end of the base
      * AVDRMFrameDescriptor: only trust them when the descriptor buffer is
      * actually large enough, otherwise fall back to mmap of the fds */
-    for (i = 0; i < AV_NUM_DATA_POINTERS; i++) {
-        if (src->buf[i] &&
-            src->buf[i]->data == src->data[0] &&
-            src->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor)) {
-            have_mpp_buffers = 1;
-            break;
-        }
-    }
+    int have_mpp_buffers = (ff_rkmpp_get_drm_desc(src) != NULL);
 
     map = av_mallocz(sizeof(*map));
     if (!map)

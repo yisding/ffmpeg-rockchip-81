@@ -40,6 +40,9 @@
 #include <rga/im2d.h>
 #endif
 
+/* Intentionally not shared with the encoder's rkmpp_get_coding_type():
+ * the decoder maps the full hardware-decodable codec set, the encoder only
+ * its supported H264/HEVC/MJPEG subset. */
 static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
 {
     switch (avctx->codec_id) {
@@ -57,6 +60,9 @@ static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
     }
 }
 
+/* Intentionally not shared: this keys on MppFrameFormat, while the encoder
+ * and hwcontext rkmpp_get_drm_format() copies key on AVPixelFormat over a
+ * different format set. */
 static uint32_t rkmpp_get_drm_format(MppFrameFormat mpp_fmt)
 {
     switch (mpp_fmt & MPP_FRAME_FMT_MASK) {
@@ -69,6 +75,8 @@ static uint32_t rkmpp_get_drm_format(MppFrameFormat mpp_fmt)
     }
 }
 
+/* Intentionally not shared with the encoder's rkmpp_get_drm_afbc_format():
+ * the decoder handles 5 formats, the encoder only its 2-format subset. */
 static uint32_t rkmpp_get_drm_afbc_format(MppFrameFormat mpp_fmt)
 {
     switch (mpp_fmt & MPP_FRAME_FMT_MASK) {
@@ -179,6 +187,10 @@ static int rkmpp_mjpeg_output_buffer_size(AVCodecContext *avctx,
     return 0;
 }
 
+/* Intentionally not shared with the encoder's get_afbc_byte_stride():
+ * this is bpp-based (av_get_padded_bits_per_pixel, semi-planar NV formats,
+ * forward direction only); the encoder version is chroma-subsampling-ratio
+ * based and operates over a disjoint input domain. */
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
                                 int *stride, int reverse)
 {
@@ -725,6 +737,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         ret = AVERROR(ENOMEM);
         goto fail;
     }
+    desc->magic = AV_RKMPP_DRM_DESC_MAGIC;
 
     desc->drm_desc.nb_objects = 1;
     desc->buffers[0] = mpp_buf;
