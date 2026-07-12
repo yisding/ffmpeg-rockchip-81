@@ -104,16 +104,6 @@ static const AVOption options[] = {
     { NULL }
 };
 
-static const enum AVPixelFormat rkmpp_dec_pix_fmts[] = {
-    AV_PIX_FMT_NV12,
-    AV_PIX_FMT_NV16,
-    AV_PIX_FMT_NV15,
-    AV_PIX_FMT_NV20_PACKED,
-    AV_PIX_FMT_NV24,
-    AV_PIX_FMT_DRM_PRIME,
-    AV_PIX_FMT_NONE,
-};
-
 static const AVCodecHWConfigInternal *const rkmpp_dec_hw_configs[] = {
     &(const AVCodecHWConfigInternal) {
         .public = {
@@ -151,7 +141,6 @@ const FFCodec ff_##x##_rkmpp_decoder = { \
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
                       FF_CODEC_CAP_INIT_CLEANUP | \
                       FF_CODEC_CAP_SETS_FRAME_PROPS, \
-    CODEC_PIXFMTS_ARRAY(rkmpp_dec_pix_fmts), \
     .hw_configs     = rkmpp_dec_hw_configs, \
     .p.wrapper_name = "rkmpp", \
 };
