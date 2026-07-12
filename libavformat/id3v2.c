@@ -316,6 +316,9 @@ static int decode_str(AVFormatContext *s, AVIOContext *pb, int encoding,
         break;
     default:
         av_log(s, AV_LOG_WARNING, "Unknown encoding %d\n", encoding);
+        ffio_free_dyn_buf(&dynbuf);
+        *dst = NULL;
+        return AVERROR_INVALIDDATA;
     }
 
 end:
