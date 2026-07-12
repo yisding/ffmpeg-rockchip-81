@@ -125,6 +125,76 @@ overlay:
     return 0;
 }
 
+typedef enum {
+    RGA_FW_GENERIC = 0, /* av_image_get_linesize + category alignment */
+    RGA_FW_NV10BIT,     /* 10-bit compact packed luma special formula */
+    RGA_FW_SCALEW,      /* width scaled by bpp then row aligned (P010/P210) */
+} RGAFwKind;
+
+typedef enum {
+    RGA_CHROMA_NONE = 0, /* single plane / packed, no chroma pitch */
+    RGA_CHROMA_EQUAL,    /* chroma pitch == luma pitch */
+    RGA_CHROMA_SUBW,     /* chroma pitch == luma pitch >> log2_chroma_w */
+    RGA_CHROMA_DOUBLE,   /* chroma pitch == luma pitch * 2 */
+} RGAChromaMode;
+
+typedef struct RGAStrideDesc {
+    enum AVPixelFormat pix_fmt;
+    int bpp_num, bpp_den;   /* luma bytes-per-pixel fraction: ws = pitch*bpp_den/bpp_num */
+    RGAFwKind fw_kind;      /* forward special-formula selector (get_aligned_linesize) */
+    int fw_row_align;       /* row align used by NV10BIT/SCALEW (0 otherwise) */
+    RGAChromaMode chroma_mode;
+    int rga3_ok;            /* 0 => RGA3-incompatible (is_pixel_stride_rga3_compat returns 0) */
+    int rga3_ws_align;      /* ws modulus */
+    int rga3_hs_align;      /* hs modulus; 0 => no hs check */
+} RGAStrideDesc;
+
+/* One row per format in the union of YUV_FORMATS + RGB_FORMATS, same order. */
+static const RGAStrideDesc rga_stride_descs[] = {
+    { AV_PIX_FMT_GRAY8,       1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   0,  0, 0 },
+    { AV_PIX_FMT_YUV420P,     1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_YUVJ420P,    1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_YUV422P,     1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_YUVJ422P,    1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_SUBW,   0,  0, 0 },
+    { AV_PIX_FMT_NV12,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_EQUAL,  1, 16, 2 },
+    { AV_PIX_FMT_NV21,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_EQUAL,  1, 16, 2 },
+    { AV_PIX_FMT_NV16,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_EQUAL,  1, 16, 2 },
+    { AV_PIX_FMT_NV24,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_DOUBLE, 0,  0, 0 },
+    { AV_PIX_FMT_NV42,        1, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_DOUBLE, 0,  0, 0 },
+    { AV_PIX_FMT_P010,        2, 1, RGA_FW_SCALEW,  64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_P210,        2, 1, RGA_FW_SCALEW,  64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_NV15,       10, 8, RGA_FW_NV10BIT, 64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_NV20_PACKED,10, 8, RGA_FW_NV10BIT, 64, RGA_CHROMA_EQUAL,  1, 64, 2 },
+    { AV_PIX_FMT_YUYV422,     2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 2 },
+    { AV_PIX_FMT_YVYU422,     2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 2 },
+    { AV_PIX_FMT_UYVY422,     2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 2 },
+    { AV_PIX_FMT_RGB555LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   0,  0, 0 },
+    { AV_PIX_FMT_BGR555LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   0,  0, 0 },
+    { AV_PIX_FMT_RGB565LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 0 },
+    { AV_PIX_FMT_BGR565LE,    2, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  8, 0 },
+    { AV_PIX_FMT_RGB24,       3, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1, 16, 0 },
+    { AV_PIX_FMT_BGR24,       3, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1, 16, 0 },
+    { AV_PIX_FMT_RGBA,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_RGB0,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_BGRA,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_BGR0,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_ARGB,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_0RGB,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_ABGR,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+    { AV_PIX_FMT_0BGR,        4, 1, RGA_FW_GENERIC,  0, RGA_CHROMA_NONE,   1,  4, 0 },
+};
+
+static const RGAStrideDesc *rga_get_stride_desc(enum AVPixelFormat pix_fmt)
+{
+    int i;
+
+    for (i = 0; i < FF_ARRAY_ELEMS(rga_stride_descs); i++) {
+        if (rga_stride_descs[i].pix_fmt == pix_fmt)
+            return &rga_stride_descs[i];
+    }
+    return NULL;
+}
+
 static int get_pixel_stride(const AVDRMObjectDescriptor *object,
                             const AVDRMLayerDescriptor *layer,
                             enum AVPixelFormat pix_fmt,
@@ -145,58 +215,22 @@ static int get_pixel_stride(const AVDRMObjectDescriptor *object,
     if (plane0->pitch <= 0 || plane0->pitch > INT_MAX)
         return AVERROR(EINVAL);
 
-    if (is_packed_fmt) {
-        int min_linesize = av_image_get_linesize(pix_fmt, width, 0);
+    {
+        const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
 
-        if (min_linesize < 0)
-            return min_linesize;
-        if (plane0->pitch < min_linesize)
+        if (!row)
             return AVERROR(EINVAL);
-        switch (pix_fmt) {
-        case AV_PIX_FMT_GRAY8:
-            *ws = plane0->pitch;
-            break;
-        case AV_PIX_FMT_RGB555LE:
-        case AV_PIX_FMT_BGR555LE:
-        case AV_PIX_FMT_RGB565LE:
-        case AV_PIX_FMT_BGR565LE:
-        case AV_PIX_FMT_YUYV422:
-        case AV_PIX_FMT_YVYU422:
-        case AV_PIX_FMT_UYVY422:
-            if (plane0->pitch % 2)
+        if (is_packed_fmt) {
+            int min_linesize = av_image_get_linesize(pix_fmt, width, 0);
+
+            if (min_linesize < 0)
+                return min_linesize;
+            if (plane0->pitch < min_linesize)
                 return AVERROR(EINVAL);
-            *ws = plane0->pitch / 2;
-            break;
-        case AV_PIX_FMT_RGB24:
-        case AV_PIX_FMT_BGR24:
-            if (plane0->pitch % 3)
-                return AVERROR(EINVAL);
-            *ws = plane0->pitch / 3;
-            break;
-        default:
-            if (plane0->pitch % 4)
-                return AVERROR(EINVAL);
-            *ws = plane0->pitch / 4;
-            break;
         }
-    } else {
-        switch (pix_fmt) {
-        case AV_PIX_FMT_P010:
-        case AV_PIX_FMT_P210:
-            if (plane0->pitch % 2)
-                return AVERROR(EINVAL);
-            *ws = plane0->pitch / 2;
-            break;
-        case AV_PIX_FMT_NV15:
-        case AV_PIX_FMT_NV20_PACKED:
-            if ((int64_t)plane0->pitch * 8 % 10)
-                return AVERROR(EINVAL);
-            *ws = (int64_t)plane0->pitch * 8 / 10;
-            break;
-        default:
-            *ws = plane0->pitch;
-            break;
-        }
+        if ((int64_t)plane0->pitch * row->bpp_den % row->bpp_num)
+            return AVERROR(EINVAL);
+        *ws = (int64_t)plane0->pitch * row->bpp_den / row->bpp_num;
     }
     if (is_packed_fmt) {
         h_stride = ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2);
@@ -461,24 +495,24 @@ static int get_aligned_linesize(enum AVPixelFormat pix_fmt, int width, int plane
     is_fully_planar = is_planar &&
                       pixdesc->comp[1].plane != pixdesc->comp[2].plane;
 
-    if (pix_fmt == AV_PIX_FMT_NV15 ||
-        pix_fmt == AV_PIX_FMT_NV20_PACKED) {
-        int width_align_256_odds = FFALIGN(width, 256) | 256;
-        return FFALIGN(width_align_256_odds * 10 / 8, 64);
+    const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
+    if (row) {
+        if (row->fw_kind == RGA_FW_NV10BIT) {
+            int wa = FFALIGN(width, 256) | 256;
+            return FFALIGN(wa * row->bpp_num / row->bpp_den, row->fw_row_align);
+        }
+        if (row->fw_kind == RGA_FW_SCALEW)
+            return FFALIGN(width, row->fw_row_align) * row->bpp_num;
+        if (row->chroma_mode == RGA_CHROMA_DOUBLE && plane)
+            return FFALIGN(width, 64) * 2;
     }
-    if (pix_fmt == AV_PIX_FMT_P010 ||
-        pix_fmt == AV_PIX_FMT_P210)
-        return FFALIGN(width, 64) * 2;
-    if ((pix_fmt == AV_PIX_FMT_NV24 ||
-         pix_fmt == AV_PIX_FMT_NV42) && plane)
-        return FFALIGN(width, 64) * 2;
 
     linesize = av_image_get_linesize(pix_fmt, width, plane);
     if (linesize < 0)
         return linesize;
 
     if (is_packed_fmt) {
-        int pixel_width = av_get_padded_bits_per_pixel(pixdesc) / 8;
+        int pixel_width = row ? row->bpp_num : av_get_padded_bits_per_pixel(pixdesc) / 8;
 
         if (pixel_width <= 0)
             return AVERROR(EINVAL);
@@ -543,32 +577,20 @@ static int reset_linear_drm_desc(AVFilterContext *avctx,
 }
 
 static int is_pixel_stride_rga3_compat(int ws, int hs,
-                                       enum _Rga_SURF_FORMAT fmt)
+                                       enum AVPixelFormat pix_fmt)
 {
-    switch (fmt) {
-    case RK_FORMAT_YCbCr_420_SP:
-    case RK_FORMAT_YCrCb_420_SP:
-    case RK_FORMAT_YCbCr_422_SP:     return !(ws % 16) && !(hs % 2);
-    case RK_FORMAT_YCbCr_420_SP_10B:
-    case RK_FORMAT_YCbCr_422_SP_10B:
-    case RK_FORMAT_P010:
-    case RK_FORMAT_P210:             return !(ws % 64) && !(hs % 2);
-    case RK_FORMAT_YUYV_422:
-    case RK_FORMAT_YVYU_422:
-    case RK_FORMAT_UYVY_422:         return !(ws % 8) && !(hs % 2);
-    case RK_FORMAT_RGB_565:
-    case RK_FORMAT_BGR_565:          return !(ws % 8);
-    case RK_FORMAT_RGB_888:
-    case RK_FORMAT_BGR_888:          return !(ws % 16);
-    case RK_FORMAT_RGBA_8888:
-    case RK_FORMAT_BGRA_8888:
-    case RK_FORMAT_ARGB_8888:
-    case RK_FORMAT_ABGR_8888:        return !(ws % 4);
-    default:                         return 0;
-    }
+    const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
+
+    if (!row || !row->rga3_ok)
+        return 0;
+    if (ws % row->rga3_ws_align)
+        return 0;
+    if (row->rga3_hs_align && (hs % row->rga3_hs_align))
+        return 0;
+    return 1;
 }
 
-static int is_rga2_core_mask(int scheduler_core)
+int ff_rkrga_is_rga2_core_mask(int scheduler_core)
 {
     return scheduler_core && scheduler_core == (scheduler_core & 0xc);
 }
@@ -606,7 +628,7 @@ static int validate_rga3_pixel_stride(AVFilterContext *avctx,
     RKRGAContext *r = avctx->priv;
 
     if (!rga3_core_can_be_used(r, out ? out->scheduler_core : r->scheduler_core) ||
-        is_pixel_stride_rga3_compat(ws, hs, info->rga_fmt))
+        is_pixel_stride_rga3_compat(ws, hs, info->pix_fmt))
         return 0;
 
     if (r->has_rga2) {
@@ -648,7 +670,7 @@ static int is_yuv_rect_aligned(const RGAFrameInfo *info, int x, int y, int w, in
            !((x | y | w | h) & (RK_RGA_YUV_ALIGN - 1));
 }
 
-static int is_rga2_only_input_format(enum AVPixelFormat pix_fmt)
+int ff_rkrga_is_rga2_only_input_format(enum AVPixelFormat pix_fmt)
 {
     switch (pix_fmt) {
     case AV_PIX_FMT_GRAY8:
@@ -664,7 +686,13 @@ static int is_rga2_only_input_format(enum AVPixelFormat pix_fmt)
     }
 }
 
-static int is_linear_rga2_only_input_format(enum AVPixelFormat pix_fmt)
+int ff_rkrga_is_rga2pro_only_format(enum AVPixelFormat pix_fmt)
+{
+    return pix_fmt == AV_PIX_FMT_NV24 ||
+           pix_fmt == AV_PIX_FMT_NV42;
+}
+
+int ff_rkrga_is_compact_10bit_format(enum AVPixelFormat pix_fmt)
 {
     return pix_fmt == AV_PIX_FMT_NV15 ||
            pix_fmt == AV_PIX_FMT_NV20_PACKED;
@@ -757,26 +785,30 @@ static int get_expected_chroma_pitch(enum AVPixelFormat pix_fmt,
                                      ptrdiff_t luma_pitch,
                                      ptrdiff_t *expected_pitch)
 {
-    int is_fully_planar;
+    const RGAStrideDesc *row = rga_get_stride_desc(pix_fmt);
 
     if (!pix_desc || !expected_pitch || luma_pitch <= 0)
         return AVERROR(EINVAL);
 
-    is_fully_planar = (pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
-                      pix_desc->nb_components >= 3 &&
-                      pix_desc->comp[1].plane != pix_desc->comp[2].plane;
+    if (!row) { /* preserve old else-branch default */
+        *expected_pitch = luma_pitch;
+        return 0;
+    }
 
-    if (is_fully_planar) {
+    switch (row->chroma_mode) {
+    case RGA_CHROMA_SUBW:
         if (luma_pitch % (1 << pix_desc->log2_chroma_w))
             return AVERROR(EINVAL);
         *expected_pitch = luma_pitch >> pix_desc->log2_chroma_w;
-    } else if (pix_fmt == AV_PIX_FMT_NV24 ||
-               pix_fmt == AV_PIX_FMT_NV42) {
+        break;
+    case RGA_CHROMA_DOUBLE:
         if (luma_pitch > INT_MAX / 2)
             return AVERROR(EINVAL);
         *expected_pitch = luma_pitch * 2;
-    } else {
+        break;
+    default: /* RGA_CHROMA_EQUAL and NONE */
         *expected_pitch = luma_pitch;
+        break;
     }
 
     return 0;
@@ -985,32 +1017,6 @@ static void release_frame(RGAFrame *frame)
     frame->locked = 0;
 }
 
-static const AVRKMPPDRMFrameDescriptor *get_rkmpp_drm_desc(const AVFrame *frame)
-{
-    const AVHWFramesContext *hwfc;
-
-    if (!frame || !frame->data[0])
-        return NULL;
-
-    /* only RKMPP hwcontext frames carry the extended descriptor: a foreign
-     * DRM_PRIME frame whose descriptor buffer merely happens to be large
-     * enough must not have its trailing bytes read as afbc_offset_y */
-    if (!frame->hw_frames_ctx)
-        return NULL;
-    hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-    if (hwfc->device_ctx->type != AV_HWDEVICE_TYPE_RKMPP)
-        return NULL;
-
-    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
-        if (frame->buf[i] &&
-            frame->buf[i]->data == frame->data[0] &&
-            frame->buf[i]->size >= sizeof(AVRKMPPDRMFrameDescriptor))
-            return (const AVRKMPPDRMFrameDescriptor *)frame->data[0];
-    }
-
-    return NULL;
-}
-
 static RGAFrame *get_free_frame(RGAFrame **list)
 {
     RGAFrame *out = *list;
@@ -1187,17 +1193,17 @@ static int verify_rga_frame_info_io_dynamic(AVFilterContext *avctx,
         return AVERROR(ENOSYS);
     }
     if (r->is_rga2_used && !r->has_rga2p &&
-        (out->act_w > 4096 || out->act_h > 4096)) {
+        (out->act_w > RKRGA_RGA2_NONPRO_MAX_DIM || out->act_h > RKRGA_RGA2_NONPRO_MAX_DIM)) {
         av_log(avctx, AV_LOG_ERROR, "Max supported output size of RGA2 (non-Pro) is 4096x4096\n");
         return AVERROR(EINVAL);
     }
     if (!r->is_rga2_used &&
-        (in->act_w < 68 || in->act_h < 2)) {
+        (in->act_w < RKRGA_RGA3_DIM_MIN_W || in->act_h < RKRGA_RGA3_DIM_MIN_H)) {
         av_log(avctx, AV_LOG_ERROR, "Min supported input size of RGA3 is 68x2\n");
         return AVERROR(EINVAL);
     }
     if (!r->is_rga2_used &&
-        (out->act_w > 8128 || out->act_h > 8128)) {
+        (out->act_w > RKRGA_RGA3_OUT_MAX_DIM || out->act_h > RKRGA_RGA3_OUT_MAX_DIM)) {
         av_log(avctx, AV_LOG_ERROR, "Max supported output size of RGA3 is 8128x8128\n");
         return AVERROR(EINVAL);
     }
@@ -1246,7 +1252,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     if (!rga_frame->frame)
         goto fail;
 
-    rkmpp_desc = get_rkmpp_drm_desc(rga_frame->frame);
+    rkmpp_desc = ff_rkmpp_get_drm_desc(rga_frame->frame);
     desc = rkmpp_desc ? &rkmpp_desc->drm_desc :
                         (AVDRMFrameDescriptor *)rga_frame->frame->data[0];
     ret = validate_drm_desc_shape(ctx, desc);
@@ -1291,7 +1297,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
             image.usage |= in_info->blend_usage;
     }
 
-    if (!is_fbc && is_linear_rga2_only_input_format(in_info->pix_fmt) &&
+    if (!is_fbc && ff_rkrga_is_compact_10bit_format(in_info->pix_fmt) &&
         !r->is_rga2_used) {
         if (!r->has_rga2) {
             av_log(ctx, AV_LOG_ERROR,
@@ -1303,7 +1309,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
     }
 
     if (is_fbc && !r->has_rga2p &&
-        (r->is_rga2_used || is_rga2_core_mask(out_info->scheduler_core))) {
+        (r->is_rga2_used || ff_rkrga_is_rga2_core_mask(out_info->scheduler_core))) {
         av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported by RGA2 (non-Pro)\n",
                av_get_pix_fmt_name(in_info->pix_fmt));
         goto fail;
@@ -1397,6 +1403,31 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 fail:
     release_frame(rga_frame);
     return NULL;
+}
+
+static int query_out_frame_strides(AVFilterContext *ctx,
+                                   const AVDRMObjectDescriptor *object,
+                                   const AVDRMLayerDescriptor *layer,
+                                   RGAFrameInfo *out_info,
+                                   RGAFrameInfo *validate_out_info,
+                                   int is_afbc, int frame_w, int frame_h,
+                                   int *w_stride, int *h_stride)
+{
+    int ret;
+    if (!is_afbc) {
+        ret = get_pixel_stride(object, layer, out_info->pix_fmt,
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
+                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
+                               frame_w, frame_h, w_stride, h_stride);
+        if (ret < 0 || !*w_stride || !*h_stride) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
+            return ret < 0 ? ret : AVERROR(EINVAL);
+        }
+    }
+    ret = validate_active_rect_stride(ctx, validate_out_info, *w_stride, *h_stride, "Output");
+    if (ret < 0)
+        return ret;
+    return validate_rga3_pixel_stride(ctx, validate_out_info, out_info, *w_stride, *h_stride, "Output");
 }
 
 static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
@@ -1509,8 +1540,8 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     if (object->fd < 0)
         goto fail;
 
-    if (r->is_rga2_used || is_rga2_core_mask(out_info->scheduler_core)) {
-        if (!r->has_rga2p && pat_preproc && (act_w > 4096 || act_h > 4096)) {
+    if (r->is_rga2_used || ff_rkrga_is_rga2_core_mask(out_info->scheduler_core)) {
+        if (!r->has_rga2p && pat_preproc && (act_w > RKRGA_RGA2_NONPRO_MAX_DIM || act_h > RKRGA_RGA2_NONPRO_MAX_DIM)) {
             av_log(ctx, AV_LOG_ERROR, "Max supported output size of RGA2 (non-Pro) is 4096x4096\n");
             goto fail;
         }
@@ -1551,45 +1582,14 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                     frame_w, frame_h);
     if (ret < 0)
         goto fail;
-    if (!is_afbc) {
-        ret = get_pixel_stride(object,
-                               layer,
-                               out_info->pix_fmt,
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               frame_w, frame_h, &w_stride, &h_stride);
-        if (ret < 0 || !w_stride || !h_stride) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
-            goto fail;
-        }
-    }
-
-    ret = validate_active_rect_stride(ctx, &validate_out_info,
-                                      w_stride, h_stride, "Output");
-    if (ret < 0)
-        goto fail;
-    ret = validate_rga3_pixel_stride(ctx, &validate_out_info, out_info,
-                                     w_stride, h_stride, "Output");
+    ret = query_out_frame_strides(ctx, object, layer, out_info, &validate_out_info,
+                                  is_afbc, frame_w, frame_h, &w_stride, &h_stride);
     if (ret < 0)
         goto fail;
     if (ret > 0 && is_afbc) {
         is_afbc = r->afbc_out = 0;
-        ret = get_pixel_stride(object,
-                               layer,
-                               out_info->pix_fmt,
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB),
-                               (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_PLANAR),
-                               frame_w, frame_h, &w_stride, &h_stride);
-        if (ret < 0 || !w_stride || !h_stride) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to get frame strides\n");
-            goto fail;
-        }
-        ret = validate_active_rect_stride(ctx, &validate_out_info,
-                                          w_stride, h_stride, "Output");
-        if (ret < 0)
-            goto fail;
-        ret = validate_rga3_pixel_stride(ctx, &validate_out_info, out_info,
-                                         w_stride, h_stride, "Output");
+        ret = query_out_frame_strides(ctx, object, layer, out_info, &validate_out_info,
+                                      is_afbc, frame_w, frame_h, &w_stride, &h_stride);
         if (ret < 0)
             goto fail;
     }
@@ -1600,7 +1600,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
 
     if (!pat_preproc) {
         int is_rga2_used = r->is_rga2_used ||
-                           is_rga2_core_mask(out_info->scheduler_core);
+                           ff_rkrga_is_rga2_core_mask(out_info->scheduler_core);
 
         if (in1_info && picref_pat) {
             enum AVColorSpace pat_colorspace = picref_pat->colorspace;
@@ -1844,10 +1844,8 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
     }
     /* NV24/NV42 requires RGA2-Pro */
     if (!r->has_rga2p &&
-        (src->pix_fmt == AV_PIX_FMT_NV24 ||
-         src->pix_fmt == AV_PIX_FMT_NV42 ||
-         dst->pix_fmt == AV_PIX_FMT_NV24 ||
-         dst->pix_fmt == AV_PIX_FMT_NV42)) {
+        (ff_rkrga_is_rga2pro_only_format(src->pix_fmt) ||
+         ff_rkrga_is_rga2pro_only_format(dst->pix_fmt))) {
         av_log(avctx, AV_LOG_ERROR, "'%s' and '%s' are only supported by RGA2-Pro\n",
                av_get_pix_fmt_name(AV_PIX_FMT_NV24),
                av_get_pix_fmt_name(AV_PIX_FMT_NV42));
@@ -1855,10 +1853,10 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
     }
     /* Input formats that requires RGA2 */
     if (!r->has_rga2 &&
-        (is_rga2_only_input_format(src->pix_fmt) ||
-         (pat && is_rga2_only_input_format(pat->pix_fmt)))) {
+        (ff_rkrga_is_rga2_only_input_format(src->pix_fmt) ||
+         (pat && ff_rkrga_is_rga2_only_input_format(pat->pix_fmt)))) {
         av_log(avctx, AV_LOG_ERROR, "'%s' as input is only supported by RGA2\n",
-               av_get_pix_fmt_name(is_rga2_only_input_format(src->pix_fmt) ?
+               av_get_pix_fmt_name(ff_rkrga_is_rga2_only_input_format(src->pix_fmt) ?
                                    src->pix_fmt : pat->pix_fmt));
         return AVERROR(ENOSYS);
     }
@@ -1924,23 +1922,21 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return AVERROR(ENOSYS);
     }
 
-    if (is_rga2_only_input_format(src->pix_fmt) ||
-        src->pix_fmt == AV_PIX_FMT_NV24 ||
-        src->pix_fmt == AV_PIX_FMT_NV42 ||
+    if (ff_rkrga_is_rga2_only_input_format(src->pix_fmt) ||
+        ff_rkrga_is_rga2pro_only_format(src->pix_fmt) ||
         dst->pix_fmt == AV_PIX_FMT_GRAY8 ||
         dst->pix_fmt == AV_PIX_FMT_YUV420P ||
         dst->pix_fmt == AV_PIX_FMT_YUVJ420P ||
         dst->pix_fmt == AV_PIX_FMT_YUV422P ||
         dst->pix_fmt == AV_PIX_FMT_YUVJ422P ||
-        dst->pix_fmt == AV_PIX_FMT_NV24 ||
-        dst->pix_fmt == AV_PIX_FMT_NV42 ||
+        ff_rkrga_is_rga2pro_only_format(dst->pix_fmt) ||
         dst->pix_fmt == AV_PIX_FMT_RGB555LE ||
         dst->pix_fmt == AV_PIX_FMT_BGR555LE ||
         dst->pix_fmt == AV_PIX_FMT_ARGB ||
         dst->pix_fmt == AV_PIX_FMT_0RGB ||
         dst->pix_fmt == AV_PIX_FMT_ABGR ||
         dst->pix_fmt == AV_PIX_FMT_0BGR ||
-        (pat && is_rga2_only_input_format(pat->pix_fmt))) {
+        (pat && ff_rkrga_is_rga2_only_input_format(pat->pix_fmt))) {
         r->is_rga2_used = 1;
     }
 
@@ -1956,25 +1952,25 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return AVERROR(ENOSYS);
     }
     if (r->has_rga3) {
-        if (scale_ratio_w < 0.125f ||
-            scale_ratio_w > 8.0f ||
-            scale_ratio_h < 0.125f ||
-            scale_ratio_h > 8.0f) {
+        if (scale_ratio_w < RKRGA_SCALE_RATIO_MIN ||
+            scale_ratio_w > RKRGA_SCALE_RATIO_MAX ||
+            scale_ratio_h < RKRGA_SCALE_RATIO_MIN ||
+            scale_ratio_h > RKRGA_SCALE_RATIO_MAX) {
             r->is_rga2_used = 1;
         }
-        if (src->act_w < 68 ||
-            src->act_w > 8176 ||
-            src->act_h < 2 ||
-            src->act_h > 8176 ||
-            dst->act_w < 68 ||
-            dst->act_w > 8128 ||
-            dst->act_h > 8128) {
+        if (src->act_w < RKRGA_RGA3_DIM_MIN_W ||
+            src->act_w > RKRGA_RGA3_IN_MAX_DIM ||
+            src->act_h < RKRGA_RGA3_DIM_MIN_H ||
+            src->act_h > RKRGA_RGA3_IN_MAX_DIM ||
+            dst->act_w < RKRGA_RGA3_DIM_MIN_W ||
+            dst->act_w > RKRGA_RGA3_OUT_MAX_DIM ||
+            dst->act_h > RKRGA_RGA3_OUT_MAX_DIM) {
             r->is_rga2_used = 1;
         }
-        if (pat && (pat->act_w < 68 ||
-             pat->act_w > 8176 ||
-             pat->act_h < 2 ||
-             pat->act_h > 8176)) {
+        if (pat && (pat->act_w < RKRGA_RGA3_DIM_MIN_W ||
+             pat->act_w > RKRGA_RGA3_IN_MAX_DIM ||
+             pat->act_h < RKRGA_RGA3_DIM_MIN_H ||
+             pat->act_h > RKRGA_RGA3_IN_MAX_DIM)) {
             r->is_rga2_used = 1;
         }
     }
@@ -1988,7 +1984,7 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return ret;
 
     if (r->is_rga2_used) {
-        if (!is_rga2_core_mask(r->scheduler_core) &&
+        if (!ff_rkrga_is_rga2_core_mask(r->scheduler_core) &&
             (r->has_rga3 || r->has_rga2p)) {
             r->scheduler_core = 0x4;
             if (r->has_rga2p)
@@ -2123,7 +2119,7 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     }
     if (is_rga3_core_mask(r->scheduler_core))
         r->has_rga2 = r->has_rga2l = r->has_rga2e = r->has_rga2p = 0;
-    if (is_rga2_core_mask(r->scheduler_core))
+    if (ff_rkrga_is_rga2_core_mask(r->scheduler_core))
         r->has_rga3 = 0;
 
     r->filter_frame = param->filter_frame;
