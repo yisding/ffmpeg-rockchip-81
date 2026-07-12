@@ -1304,6 +1304,7 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
                 av_log(avctx, AV_LOG_ERROR, "Failed to init extradata packet: %d\n", ret);
                 return AVERROR_EXTERNAL;
             }
+            mpp_packet_set_extra_data(mpp_pkt);
             ret = r->mapi->decode_put_packet(r->mctx, mpp_pkt);
             mpp_packet_deinit(&mpp_pkt);
             if (ret != MPP_OK) {
