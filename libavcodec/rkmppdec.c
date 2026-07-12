@@ -984,12 +984,12 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         }
         if (mpp_frame_get_discard(mpp_frame)) {
             av_log(avctx, AV_LOG_DEBUG, "Received a 'discard' frame\n");
-            /* during draining decodable frames may still be queued behind the
-             * discarded one: retry, otherwise the caller would turn the EAGAIN
-             * into a premature EOF */
+            /* During draining, consume any frame already queued behind the
+             * discarded one. Do not start another blocking wait: if the queue
+             * is empty, EAGAIN is converted to EOF by the caller. */
             if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
                 mpp_frame_deinit(&mpp_frame);
-                timeout = MPP_TIMEOUT_MAX;
+                timeout = MPP_TIMEOUT_NON_BLOCK;
                 continue;
             }
             ret = AVERROR(EAGAIN);
@@ -1019,9 +1019,11 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             }
             /* return decodable frames flagged as corrupt, drop buffer-less ones */
             if (!mpp_frame_get_buffer(mpp_frame)) {
+                /* As with discard frames, drain only output that is already
+                 * queued so malformed output cannot trigger repeated waits. */
                 if (r->draining && avctx->codec_id != AV_CODEC_ID_MJPEG) {
                     mpp_frame_deinit(&mpp_frame);
-                    timeout = MPP_TIMEOUT_MAX;
+                    timeout = MPP_TIMEOUT_NON_BLOCK;
                     continue;
                 }
                 ret = AVERROR(EAGAIN);
