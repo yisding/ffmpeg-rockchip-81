@@ -26,6 +26,7 @@
 
 #include "config_components.h"
 #include "encode.h"
+#include "packet_internal.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "rkmppenc.h"
@@ -1605,9 +1606,9 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
 
     mpp_meta_get_s32(mpp_meta, KEY_ENC_AVERAGE_QP, &avg_qp);
     if (avg_qp >= 0)
-        ff_encode_add_stats_side_data(packet, avg_qp * FF_QP2LAMBDA, NULL, 0,
-                                      (packet->flags & AV_PKT_FLAG_KEY) ?
-                                      AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P);
+        ff_side_data_set_encoder_stats(packet, avg_qp * FF_QP2LAMBDA, NULL, 0,
+                                       (packet->flags & AV_PKT_FLAG_KEY) ?
+                                       AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P);
 
     if ((ret = mpp_meta_get_frame(mpp_meta, KEY_INPUT_FRAME, &mpp_frame)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to get key input frame from packet meta: %d\n", ret);
