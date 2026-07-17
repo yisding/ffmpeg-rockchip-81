@@ -31,6 +31,14 @@
 #include "libavutil/mem.h"
 #include "rkmppenc.h"
 
+/*
+ * A missing hardware completion must not wedge avcodec_send/receive or close
+ * forever. Synchronous low-delay and drain calls normally complete in a few
+ * milliseconds; return EAGAIN after this deadline while keeping the regular
+ * asynchronous path nonblocking.
+ */
+#define RKMPP_SYNC_TIMEOUT_MS 500
+
 static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
 {
     switch (avctx->codec_id) {
@@ -1657,10 +1665,10 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
                    avctx->codec_id == AV_CODEC_ID_HEVC ||
                    avctx->codec_id == AV_CODEC_ID_MJPEG) &&
                    !(avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
-                   ? MPP_TIMEOUT_NON_BLOCK : MPP_TIMEOUT_BLOCK;
+                   ? MPP_TIMEOUT_NON_BLOCK : RKMPP_SYNC_TIMEOUT_MS;
 
     if (!frame)
-        timeout = MPP_TIMEOUT_BLOCK;
+        timeout = RKMPP_SYNC_TIMEOUT_MS;
 
     clear_unused_frames(r->frame_list);
 
