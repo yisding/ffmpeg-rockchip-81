@@ -29,6 +29,7 @@
 #include "packet_internal.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
+#include "libavutil/time.h"
 #include "rkmppenc.h"
 
 /*
@@ -38,6 +39,16 @@
  * asynchronous path nonblocking.
  */
 #define RKMPP_SYNC_TIMEOUT_MS 500
+
+/*
+ * The MPP async encoder has a finite input task pool and applies backpressure:
+ * encode_put_frame returns MPP_NOK when no input slot is momentarily free (the
+ * previous frame's slot has not been reclaimed yet under sustained load). On a
+ * synchronous call that is a transient condition, not a failure, so back off
+ * briefly and retry the put within the synchronous deadline instead of blocking
+ * the output wait on a frame that never got submitted.
+ */
+#define RKMPP_INPUT_RETRY_US 250
 
 static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
 {
@@ -1563,8 +1574,14 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     }
 
     if ((ret = r->mapi->encode_get_packet(r->mctx, &mpp_pkt)) != MPP_OK) {
-        int log_level = (ret == MPP_NOK) ? AV_LOG_DEBUG : AV_LOG_ERROR;
-        ret = (ret == MPP_NOK) ? AVERROR(EAGAIN) : AVERROR_EXTERNAL;
+        /* MPP_NOK: output queue momentarily empty (nonblocking poll).
+         * MPP_ERR_TIMEOUT: the bounded synchronous wait elapsed with no packet.
+         * Both mean "no packet yet", not a hard failure - surface EAGAIN so the
+         * caller retries (matching the RKMPP_SYNC_TIMEOUT_MS contract) rather
+         * than tearing the encoder down. */
+        int transient = (ret == MPP_NOK || ret == MPP_ERR_TIMEOUT);
+        int log_level = transient ? AV_LOG_DEBUG : AV_LOG_ERROR;
+        ret = transient ? AVERROR(EAGAIN) : AVERROR_EXTERNAL;
         av_log(avctx, log_level, "Failed to get packet from encoder output queue: %d\n", ret);
         return ret;
     }
@@ -1666,9 +1683,17 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
                    avctx->codec_id == AV_CODEC_ID_MJPEG) &&
                    !(avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
                    ? MPP_TIMEOUT_NON_BLOCK : RKMPP_SYNC_TIMEOUT_MS;
+    int synchronous = timeout != MPP_TIMEOUT_NON_BLOCK;
+    /* Shared deadline for the whole synchronous call: input backpressure
+     * retries and the output wait draw from the same RKMPP_SYNC_TIMEOUT_MS
+     * budget, so absorbing a transient full input pool never lets a call run
+     * past its deadline. */
+    int64_t deadline = av_gettime_relative() + (int64_t)RKMPP_SYNC_TIMEOUT_MS * 1000;
 
-    if (!frame)
+    if (!frame) {
         timeout = RKMPP_SYNC_TIMEOUT_MS;
+        synchronous = 1;
+    }
 
     clear_unused_frames(r->frame_list);
 
@@ -1689,14 +1714,27 @@ send:
     if (mpp_enc_frame &&
         get_sent_frame_count(r->frame_list) <= r->async_frames) {
         ret = rkmpp_send_frame(avctx, mpp_enc_frame);
-        if (ret == AVERROR(EAGAIN))
+        if (ret == AVERROR(EAGAIN)) {
+            /* Input task pool momentarily full. On a synchronous call retry the
+             * put after a short backoff (the previous frame's slot is reclaimed
+             * asynchronously) rather than waiting on output for a frame that was
+             * never submitted; on the async path fall through to draining. */
+            int64_t now = av_gettime_relative();
+            if (synchronous && now < deadline) {
+                av_usleep((unsigned)FFMIN(RKMPP_INPUT_RETRY_US, deadline - now));
+                goto send;
+            }
             goto get;
-        else if (ret)
+        } else if (ret)
             return ret;
         mpp_enc_frame->sent = 1;
     }
 
 get:
+    if (synchronous) {
+        int64_t now = av_gettime_relative();
+        timeout = now < deadline ? (int)((deadline - now) / 1000) : MPP_TIMEOUT_NON_BLOCK;
+    }
     ret = rkmpp_get_packet(avctx, packet, timeout);
     if (!frame && ret == AVERROR(EAGAIN) &&
         get_oldest_unsent_frame(r->frame_list))
